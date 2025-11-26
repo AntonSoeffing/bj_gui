@@ -1,0 +1,27 @@
+{
+  "deck_number": 3,
+  "max_splits": 2,
+  "dealer_hits_soft17": false,
+  "dealer_peeks": true,
+  "das": false,
+  "allow_double": true,
+  "allow_insurance": false,
+  "allow_surrender": false,
+  "burn_count": 1,
+  "bankroll": 170000.0,
+  "unit_percent": 0.5,
+  "cards_seen_counts": {
+    "2": 4,
+    "3": 0,
+    "4": 0,
+    "5": 1,
+    "6": 0,
+    "7": 1,
+    "8": 1,
+    "9": 1,
+    "10": 3,
+    "11": 0
+  },
+  "player_cards": [],
+  "dealer_cards": []
+}

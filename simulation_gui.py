@@ -1,0 +1,787 @@
+# -*- coding: utf-8 -*-
+"""Interactive GUI for blackjack simulations."""
+
+from __future__ import annotations
+
+import json
+import random
+import tkinter as tk
+from collections import Counter
+from pathlib import Path
+
+from tkinter import messagebox, ttk
+from typing import Dict, Iterable, List
+
+from betting_strategies import CardCountBetter
+from best_move import perfect_mover_cache
+from utils import DECK, get_hilo_running_count
+
+CARD_VALUES: tuple[int, ...] = tuple(range(2, 12))
+CARD_LABELS: Dict[int, str] = {value: ("A" if value == 11 else str(value)) for value in CARD_VALUES}
+CARD_ICONS: Dict[int, str] = {
+    2: "🂢",
+    3: "🂣",
+    4: "🂤",
+    5: "🂥",
+    6: "🂦",
+    7: "🂧",
+    8: "🂨",
+    9: "🂩",
+    10: "🂪",
+    11: "🂡",
+}
+ACTION_LABELS: tuple[str, ...] = ("Stand", "Hit", "Double", "Split", "Surrender")
+
+DARK_BG = "#1e1e1e"
+PANEL_BG = "#252526"
+BUTTON_BG = "#3a3d41"
+BUTTON_ACTIVE_BG = "#005a9e"
+TEXT_COLOR = "#f3f3f3"
+ACCENT_COLOR = "#0a84ff"
+STATE_FILE = Path(__file__).with_name("simulation_state.json")
+
+
+class BlackjackSimulatorGUI:
+    """Tkinter GUI that orchestrates rule selection, card tracking, and simulations."""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Blackjack Simulation GUI")
+        self.root.geometry("980x720")
+        self._apply_dark_theme()
+
+        self.deck_number_var = tk.IntVar(value=3)
+        self.max_splits_var = tk.IntVar(value=2)
+        self.dealer_hits_soft17_var = tk.BooleanVar(value=False)
+        self.dealer_peeks_var = tk.BooleanVar(value=True)
+        self.das_var = tk.BooleanVar(value=True)
+        self.allow_double_var = tk.BooleanVar(value=True)
+        self.allow_insurance_var = tk.BooleanVar(value=False)
+        self.allow_surrender_var = tk.BooleanVar(value=False)
+        self.bankroll_var = tk.DoubleVar(value=1000.0)
+        self.unit_percent_var = tk.DoubleVar(value=0.5)
+
+        self._state_path = STATE_FILE
+        self._suspend_state = False
+
+        self.cards_seen_counts: Dict[int, int] = {value: 0 for value in CARD_VALUES}
+        self.card_buttons: Dict[int, tk.Button] = {}
+        self.player_hand_buttons: Dict[int, tk.Button] = {}
+        self.dealer_hand_buttons: Dict[int, tk.Button] = {}
+        self.burn_count_var = tk.IntVar(value=5)
+
+        self.player_cards: List[int] = []
+        self.dealer_cards: List[int] = []
+
+        self.player_listbox: tk.Listbox
+        self.dealer_listbox: tk.Listbox
+        self.player_summary_var = tk.StringVar(value="Player total: 0")
+        self.dealer_summary_var = tk.StringVar(value="Dealer total: 0")
+
+        self.best_action_var = tk.StringVar(value="Best action: —")
+        self.ev_breakdown_var = tk.StringVar(value="Stand: –, Hit: –, Double: –, Split: –, Surrender: –")
+        self.insurance_var = tk.StringVar(value="Insurance EV: –")
+        self.bet_var = tk.StringVar(value="Suggested bet: 1 unit")
+        self.counts_var = tk.StringVar(value="Running: +0 | True: +0.00 | Cards left: 0")
+        self.status_var = tk.StringVar(value="")
+
+        self._load_state()
+        self._build_layout()
+        self._sync_ui_from_state()
+        self._register_traces()
+        self._update_betting_info()
+        self._state_changed()
+
+    def _build_layout(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+
+        self._build_rules_section()
+        self._build_seen_cards_section()
+        self._build_hand_section()
+        self._build_actions_section()
+        self._build_results_section()
+
+    def _register_traces(self) -> None:
+        self.deck_number_var.trace_add("write", self._handle_deck_change)
+        self.max_splits_var.trace_add("write", self._handle_max_splits_change)
+        self.bankroll_var.trace_add("write", self._handle_bankroll_change)
+        self.unit_percent_var.trace_add("write", self._handle_unit_percent_change)
+
+    def _build_rules_section(self) -> None:
+        frame = ttk.LabelFrame(self.root, text="Rules")
+        frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        frame.columnconfigure(9, weight=1)
+
+        ttk.Label(frame, text="Decks:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        deck_spin = tk.Spinbox(frame, from_=1, to=12, textvariable=self.deck_number_var, width=5)
+        deck_spin.grid(row=0, column=1, padx=4, pady=4)
+        self._style_entry(deck_spin)
+
+        ttk.Label(frame, text="Max splits:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        splits_spin = tk.Spinbox(frame, from_=0, to=3, textvariable=self.max_splits_var, width=5)
+        splits_spin.grid(row=0, column=3, padx=4, pady=4)
+        self._style_entry(splits_spin)
+
+        ttk.Checkbutton(frame, text="Dealer hits soft 17", variable=self.dealer_hits_soft17_var,
+                command=self._on_rule_toggle).grid(row=0, column=4, padx=4, pady=4, sticky="w")
+        ttk.Checkbutton(frame, text="Dealer peeks for blackjack", variable=self.dealer_peeks_var,
+                command=self._on_rule_toggle).grid(row=0, column=5, padx=4, pady=4, sticky="w")
+        ttk.Checkbutton(frame, text="Double after split (DAS)", variable=self.das_var,
+                command=self._on_rule_toggle).grid(row=0, column=6, padx=4, pady=4, sticky="w")
+        ttk.Checkbutton(frame, text="Allow double", variable=self.allow_double_var,
+                command=self._on_rule_toggle).grid(row=1, column=0, padx=4, pady=4, sticky="w")
+        ttk.Checkbutton(frame, text="Allow insurance", variable=self.allow_insurance_var,
+                command=self._on_rule_toggle).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        ttk.Checkbutton(frame, text="Allow surrender", variable=self.allow_surrender_var,
+                command=self._on_rule_toggle).grid(row=1, column=2, padx=4, pady=4, sticky="w")
+
+        ttk.Label(frame, text="Bankroll ($):").grid(row=2, column=0, sticky="w", padx=4, pady=(8, 4))
+        bankroll_spin = tk.Spinbox(frame, from_=0, to=10_000_000, increment=50, textvariable=self.bankroll_var, width=10)
+        bankroll_spin.grid(row=2, column=1, padx=4, pady=(8, 4))
+        self._style_entry(bankroll_spin)
+
+        ttk.Label(frame, text="Unit % per count unit:").grid(row=2, column=2, sticky="w", padx=4, pady=(8, 4))
+        unit_spin = tk.Spinbox(frame, from_=0.1, to=20.0, increment=0.1, textvariable=self.unit_percent_var, width=10)
+        unit_spin.grid(row=2, column=3, padx=4, pady=(8, 4))
+        self._style_entry(unit_spin)
+
+    def _build_seen_cards_section(self) -> None:
+        frame = ttk.LabelFrame(self.root, text="Seen Cards")
+        frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+        frame.columnconfigure(tuple(range(11)), weight=1)
+
+        info = ("Left click adds. Shift+Click or right click removes. Use 'Game Ended' to log both hands here automatically.")
+        ttk.Label(frame, text=info, wraplength=600).grid(row=0, column=0, columnspan=11, pady=(0, 6), sticky="w")
+
+        for idx, value in enumerate(CARD_VALUES):
+            btn = self._create_dark_button(frame, text=self._seen_card_text(value), width=8)
+            btn.grid(row=1, column=idx, padx=2, pady=2, sticky="ew")
+            btn.bind("<Button-1>", lambda event, val=value: self._modify_seen_card(val, 1))
+            btn.bind("<Shift-Button-1>", lambda event, val=value: self._modify_seen_card(val, -1))
+            btn.bind("<Button-3>", lambda event, val=value: self._modify_seen_card(val, -1))
+            self.card_buttons[value] = btn
+
+        ttk.Button(frame, text="Clear Seen Cards", command=self._confirm_clear_seen_cards).grid(row=2, column=0,
+                              columnspan=11, pady=(8, 0))
+
+        burn_frame = ttk.Frame(frame)
+        burn_frame.grid(row=3, column=0, columnspan=11, pady=(6, 0), sticky="ew")
+        ttk.Label(burn_frame, text="Remove unknown cards:").grid(row=0, column=0, padx=4, sticky="w")
+        burn_spin = tk.Spinbox(burn_frame, from_=1, to=312, textvariable=self.burn_count_var, width=6)
+        burn_spin.grid(row=0, column=1, padx=4)
+        self._style_entry(burn_spin)
+        ttk.Button(burn_frame, text="Burn", command=self._confirm_burn_cards).grid(row=0, column=2, padx=4)
+        burn_frame.columnconfigure(3, weight=1)
+
+    def _build_hand_section(self) -> None:
+        container = ttk.LabelFrame(self.root, text="Hands")
+        container.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        player_frame = ttk.Frame(container)
+        player_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        player_frame.columnconfigure(0, weight=1)
+        player_frame.rowconfigure(1, weight=1)
+        ttk.Label(player_frame, textvariable=self.player_summary_var).grid(row=0, column=0, sticky="w")
+        self.player_listbox = tk.Listbox(player_frame, height=6)
+        self.player_listbox.grid(row=1, column=0, sticky="nsew", pady=4)
+        self._style_listbox(self.player_listbox)
+        ttk.Button(player_frame, text="Remove Selected", command=lambda: self._remove_selected_card("player")) \
+            .grid(row=2, column=0, pady=2, sticky="ew")
+        ttk.Button(player_frame, text="Clear Player", command=lambda: self._clear_hand("player")) \
+            .grid(row=3, column=0, pady=2, sticky="ew")
+        ttk.Label(player_frame, text="Left click a rank to add. Shift/right click to remove.").grid(
+            row=4, column=0, sticky="w", pady=(6, 0))
+        player_buttons_frame = ttk.Frame(player_frame)
+        player_buttons_frame.grid(row=5, column=0, sticky="ew")
+        self.player_hand_buttons = self._build_hand_card_buttons(player_buttons_frame, "player")
+
+        dealer_frame = ttk.Frame(container)
+        dealer_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+        dealer_frame.columnconfigure(0, weight=1)
+        dealer_frame.rowconfigure(1, weight=1)
+        ttk.Label(dealer_frame, textvariable=self.dealer_summary_var).grid(row=0, column=0, sticky="w")
+        self.dealer_listbox = tk.Listbox(dealer_frame, height=6)
+        self.dealer_listbox.grid(row=1, column=0, sticky="nsew", pady=4)
+        self._style_listbox(self.dealer_listbox)
+        ttk.Button(dealer_frame, text="Remove Selected", command=lambda: self._remove_selected_card("dealer")) \
+            .grid(row=2, column=0, pady=2, sticky="ew")
+        ttk.Button(dealer_frame, text="Clear Dealer", command=lambda: self._clear_hand("dealer")) \
+            .grid(row=3, column=0, pady=2, sticky="ew")
+        ttk.Label(dealer_frame, text="Left click to add, Shift/right click to remove. First dealer card is the up card.").grid(
+            row=4, column=0, sticky="w", pady=(6, 0))
+        dealer_buttons_frame = ttk.Frame(dealer_frame)
+        dealer_buttons_frame.grid(row=5, column=0, sticky="ew")
+        self.dealer_hand_buttons = self._build_hand_card_buttons(dealer_buttons_frame, "dealer")
+
+    def _build_actions_section(self) -> None:
+        frame = ttk.Frame(self.root)
+        frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+        frame.columnconfigure(2, weight=1)
+        ttk.Button(frame, text="Run Simulation", command=self._simulate).grid(row=0, column=0, padx=4, pady=4)
+        ttk.Button(frame, text="Game Ended", command=self._record_game_end).grid(row=0, column=1, padx=4, pady=4)
+        ttk.Button(frame, text="Clear Everything", command=self._confirm_clear_everything).grid(row=0, column=2, padx=4, pady=4, sticky="w")
+        ttk.Label(frame, textvariable=self.status_var, foreground="gray").grid(row=1, column=0, columnspan=3, sticky="w")
+
+    def _build_results_section(self) -> None:
+        frame = ttk.LabelFrame(self.root, text="Results & Betting")
+        frame.grid(row=4, column=0, padx=10, pady=10, sticky="ew")
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, textvariable=self.best_action_var, font=("TkDefaultFont", 12, "bold")) \
+            .grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(frame, textvariable=self.ev_breakdown_var).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(frame, textvariable=self.insurance_var).grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(frame, textvariable=self.bet_var).grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(frame, textvariable=self.counts_var).grid(row=4, column=0, sticky="w", pady=2)
+
+    def _seen_card_text(self, value: int) -> str:
+        return f"{self._card_face(value)}\n({self.cards_seen_counts[value]})"
+
+    def _modify_seen_card(self, value: int, delta: int) -> None:
+        max_manual = self._max_manual_seen_count(value)
+        new_value = self.cards_seen_counts[value] + delta
+        if new_value < 0:
+            new_value = 0
+        elif new_value > max_manual:
+            new_value = max_manual
+        if new_value == self.cards_seen_counts[value] and delta > 0 and max_manual == self.cards_seen_counts[value]:
+            self._set_status(f"No {CARD_LABELS[value]} cards left to mark as seen.")
+            return
+        self.cards_seen_counts[value] = new_value
+        self._update_seen_card_button(value)
+        self._update_betting_info()
+        self._state_changed()
+
+    def _max_manual_seen_count(self, value: int) -> int:
+        capacity = self._total_card_capacity(value)
+        used_in_hands = self.player_cards.count(value) + self.dealer_cards.count(value)
+        return max(capacity - used_in_hands, 0)
+
+    def _total_card_capacity(self, value: int) -> int:
+        per_deck = 16 if value == 10 else 4
+        return self.deck_number_var.get() * per_deck
+
+    def _update_seen_card_button(self, value: int) -> None:
+        self.card_buttons[value].configure(text=self._seen_card_text(value))
+
+    def _clear_seen_cards(self) -> None:
+        for value in CARD_VALUES:
+            self.cards_seen_counts[value] = 0
+            self._update_seen_card_button(value)
+        self._update_betting_info()
+        self._state_changed()
+
+    def _burn_unknown_cards(self) -> None:
+        count = max(self.burn_count_var.get(), 0)
+        if count <= 0:
+            self._set_status("Enter how many cards to remove.")
+            return
+        try:
+            remaining_shoe = list(self._build_cards_not_seen())
+        except ValueError as exc:
+            messagebox.showerror("Invalid shoe", str(exc))
+            return
+        available = len(remaining_shoe)
+        if available == 0:
+            self._set_status("No cards left to remove.")
+            return
+        if count > available:
+            messagebox.showerror("Invalid burn", f"Only {available} cards remain in the shoe.")
+            return
+        drawn_cards = random.sample(remaining_shoe, count)
+        drawn_counts = Counter(drawn_cards)
+        for value, amount in drawn_counts.items():
+            self.cards_seen_counts[value] += amount
+            self._update_seen_card_button(value)
+        self._update_betting_info()
+        summary = ", ".join(f"{CARD_LABELS[value]}x{amount}" for value, amount in sorted(drawn_counts.items()))
+        self._set_status(f"Burned cards: {summary}")
+        self._state_changed()
+
+    def _modify_hand_card(self, target: str, value: int, delta: int) -> None:
+        if delta > 0:
+            self._add_card_to_hand(target, value)
+        else:
+            self._remove_card_by_value(target, value)
+
+    def _add_card_to_hand(self, target: str, value: int) -> None:
+        capacity = self._total_card_capacity(value)
+        manual_seen = self.cards_seen_counts[value]
+        hand_count = self.player_cards.count(value) + self.dealer_cards.count(value)
+        if manual_seen + hand_count >= capacity:
+            self._set_status(f"All {CARD_LABELS[value]} cards already accounted for.")
+            return
+        if target == "player":
+            self.player_cards.append(value)
+            self._refresh_listbox(self.player_listbox, self.player_cards)
+            self._update_hand_button("player", value)
+        else:
+            self.dealer_cards.append(value)
+            self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
+            self._update_hand_button("dealer", value)
+        self._update_hand_summaries()
+        self._update_betting_info()
+        self._state_changed()
+
+    def _remove_card_by_value(self, target: str, value: int) -> None:
+        cards = self.player_cards if target == "player" else self.dealer_cards
+        for idx in range(len(cards) - 1, -1, -1):
+            if cards[idx] == value:
+                cards.pop(idx)
+                listbox = self.player_listbox if target == "player" else self.dealer_listbox
+                self._refresh_listbox(listbox, cards)
+                self._update_hand_button(target, value)
+                self._update_hand_summaries()
+                self._update_betting_info()
+                self._state_changed()
+                return
+        self._set_status(f"No {CARD_LABELS[value]} cards to remove from {target} hand.")
+
+    def _remove_selected_card(self, target: str) -> None:
+        listbox = self.player_listbox if target == "player" else self.dealer_listbox
+        cards = self.player_cards if target == "player" else self.dealer_cards
+        selection = listbox.curselection()
+        if not selection:
+            return
+        changed = False
+        for index in reversed(selection):
+            if 0 <= index < len(cards):
+                cards.pop(index)
+                changed = True
+        self._refresh_listbox(listbox, cards)
+        self._refresh_hand_buttons(target)
+        self._update_hand_summaries()
+        self._update_betting_info()
+        if changed:
+            self._state_changed()
+
+    def _clear_hand(self, target: str) -> None:
+        if target == "player":
+            self.player_cards.clear()
+            self._refresh_listbox(self.player_listbox, self.player_cards)
+            self._refresh_hand_buttons("player")
+        else:
+            self.dealer_cards.clear()
+            self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
+            self._refresh_hand_buttons("dealer")
+        self._update_hand_summaries()
+        self._update_betting_info()
+        self._state_changed()
+
+    def _refresh_listbox(self, listbox: tk.Listbox, cards: List[int]) -> None:
+        listbox.delete(0, tk.END)
+        for card in cards:
+            listbox.insert(tk.END, CARD_LABELS[card])
+
+    def _update_hand_summaries(self) -> None:
+        self.player_summary_var.set(f"Player total: {self._hand_value(self.player_cards)} (cards: {len(self.player_cards)})")
+        dealer_total = self._hand_value(self.dealer_cards)
+        self.dealer_summary_var.set(f"Dealer total: {dealer_total} (cards: {len(self.dealer_cards)})")
+
+    def _hand_value(self, cards: List[int]) -> int:
+        total = sum(cards)
+        aces = cards.count(11)
+        while total > 21 and aces:
+            total -= 10
+            aces -= 1
+        return total
+
+    def _clear_all(self) -> None:
+        self._clear_hand("player")
+        self._clear_hand("dealer")
+        self._clear_seen_cards()
+        self.best_action_var.set("Best action: —")
+        self.ev_breakdown_var.set("Stand: –, Hit: –, Double: –, Split: –, Surrender: –")
+        self.insurance_var.set("Insurance EV: –")
+        self.status_var.set("")
+
+    def _record_game_end(self) -> None:
+        if not self.player_cards and not self.dealer_cards:
+            self._set_status("Nothing to record. Add cards first.")
+            return
+        moved_cards = self.player_cards + self.dealer_cards
+        for card in moved_cards:
+            self.cards_seen_counts[card] += 1
+            self._update_seen_card_button(card)
+        self._clear_hand("player")
+        self._clear_hand("dealer")
+        self._set_status("Hands recorded as seen cards.")
+        self._state_changed()
+
+    def _simulate(self) -> None:
+        if not self.player_cards:
+            messagebox.showerror("Missing data", "Add at least one player card before simulating.")
+            return
+        if not self.dealer_cards:
+            messagebox.showerror("Missing data", "Add at least one dealer card (the up card).")
+            return
+        try:
+            cards_not_seen = self._build_cards_not_seen()
+        except ValueError as exc:
+            messagebox.showerror("Invalid shoe", str(exc))
+            return
+        dealer_up_card = self.dealer_cards[0]
+        try:
+            profits = perfect_mover_cache(
+                cards=tuple(self.player_cards),
+                dealer_up_card=dealer_up_card,
+                cards_not_seen=cards_not_seen,
+                can_double=self.allow_double_var.get(),
+                can_insure=self.allow_insurance_var.get(),
+                can_surrender=self.allow_surrender_var.get(),
+                max_splits=self.max_splits_var.get(),
+                dealer_peeks_for_blackjack=self.dealer_peeks_var.get(),
+                das=self.das_var.get(),
+                dealer_stands_soft_17=not self.dealer_hits_soft17_var.get(),
+                return_all_profits=True,
+            )
+        except Exception as exc:  # pragma: no cover - safeguard for unexpected runtime issues
+            messagebox.showerror("Simulation error", str(exc))
+            return
+        self._display_results(profits)
+
+    def _build_cards_not_seen(self) -> tuple[int, ...]:
+        deck_number = self.deck_number_var.get()
+        if deck_number <= 0:
+            raise ValueError("Deck number must be at least 1.")
+        shoe = list(DECK) * deck_number
+        total_seen = self._get_total_seen_cards(include_hands=True)
+        for card in total_seen:
+            try:
+                shoe.remove(card)
+            except ValueError as exc:
+                label = CARD_LABELS[card]
+                raise ValueError(f"Too many {label}s have been entered for {deck_number} deck(s).") from exc
+        return tuple(sorted(shoe))
+
+    def _get_total_seen_cards(self, include_hands: bool) -> List[int]:
+        cards: List[int] = []
+        for value, count in self.cards_seen_counts.items():
+            cards.extend([value] * count)
+        if include_hands:
+            cards.extend(self.player_cards)
+            cards.extend(self.dealer_cards)
+        return cards
+
+    def _display_results(self, profits: tuple[float, ...]) -> None:
+        action_profits = profits[:5]
+        insurance_profit = profits[5] if len(profits) > 5 else float("nan")
+        best_index = max(range(len(action_profits)), key=lambda idx: action_profits[idx])
+        best_action = ACTION_LABELS[best_index]
+        best_value = action_profits[best_index]
+        self.best_action_var.set(f"Best action: {best_action} (EV: {best_value:+.3f})")
+        breakdown_parts = [f"{label}: {value:+.3f}" for label, value in zip(ACTION_LABELS, action_profits)]
+        self.ev_breakdown_var.set(", ".join(breakdown_parts))
+        insurance_text = f"Insurance EV: {insurance_profit:+.3f} (" + ("Take" if insurance_profit > 0 else "Skip") + ")"
+        self.insurance_var.set(insurance_text)
+        self._set_status("Simulation complete.")
+
+    def _update_betting_info(self) -> None:
+        cards_seen = self._get_total_seen_cards(include_hands=True)
+        deck_number = max(self.deck_number_var.get(), 1)
+        running = get_hilo_running_count(cards_seen)
+        cards_left = deck_number * 52 - len(cards_seen)
+        true_count = 0.0 if cards_left <= 0 else running / (cards_left / 52)
+        try:
+            bet_units = CardCountBetter.get_bet(cards_seen, deck_number)
+        except ZeroDivisionError:
+            bet_units = 0
+        actual_bet = self._calculate_actual_bet(bet_units)
+        if bet_units == 0:
+            bet_text = "Suggested bet: Sit out"
+        else:
+            approx_text = f" (~{self._format_currency(actual_bet)})" if actual_bet > 0 else ""
+            bet_text = f"Suggested bet: {bet_units} unit{'s' if bet_units != 1 else ''}{approx_text}"
+        self.bet_var.set(bet_text)
+        self.counts_var.set(f"Running: {running:+} | True: {true_count:+.2f} | Cards left: {max(cards_left, 0)}")
+
+    def _set_status(self, message: str) -> None:
+        self.status_var.set(message)
+        if message:
+            self.root.after(4000, lambda: self.status_var.set(""))
+
+    def _handle_deck_change(self, *_: object) -> None:
+        try:
+            value = self.deck_number_var.get()
+        except tk.TclError:
+            value = 1
+        if value < 1:
+            value = 1
+        self.deck_number_var.set(value)
+        self._clamp_seen_counts()
+        self._update_betting_info()
+        self._state_changed()
+
+    def _handle_max_splits_change(self, *_: object) -> None:
+        try:
+            value = self.max_splits_var.get()
+        except tk.TclError:
+            value = 0
+        if value < 0:
+            self.max_splits_var.set(0)
+        elif value > 3:
+            self.max_splits_var.set(3)
+        else:
+            self.max_splits_var.set(value)
+        self._state_changed()
+
+    def _handle_bankroll_change(self, *_: object) -> None:
+        try:
+            value = float(self.bankroll_var.get())
+        except (tk.TclError, ValueError):
+            value = 0.0
+        if value < 0:
+            value = 0.0
+        self.bankroll_var.set(value)
+        self._update_betting_info()
+        self._state_changed()
+
+    def _handle_unit_percent_change(self, *_: object) -> None:
+        try:
+            value = float(self.unit_percent_var.get())
+        except (tk.TclError, ValueError):
+            value = 0.0
+        if value < 0:
+            value = 0.0
+        elif value > 100:
+            value = 100.0
+        self.unit_percent_var.set(value)
+        self._update_betting_info()
+        self._state_changed()
+
+    def _clamp_seen_counts(self) -> None:
+        for value in CARD_VALUES:
+            max_manual = self._max_manual_seen_count(value)
+            if self.cards_seen_counts[value] > max_manual:
+                self.cards_seen_counts[value] = max_manual
+            self._update_seen_card_button(value)
+        self._state_changed()
+
+    def _build_hand_card_buttons(self, parent: ttk.Frame, target: str) -> Dict[int, tk.Button]:
+        buttons: Dict[int, tk.Button] = {}
+        columns = 6
+        for idx, value in enumerate(CARD_VALUES):
+            btn = self._create_dark_button(parent, text=self._hand_button_text(target, value), width=6)
+            btn.grid(row=idx // columns, column=idx % columns, padx=2, pady=2, sticky="ew")
+            btn.bind("<Button-1>", lambda event, val=value, tgt=target: self._modify_hand_card(tgt, val, 1))
+            btn.bind("<Shift-Button-1>", lambda event, val=value, tgt=target: self._modify_hand_card(tgt, val, -1))
+            btn.bind("<Button-3>", lambda event, val=value, tgt=target: self._modify_hand_card(tgt, val, -1))
+            buttons[value] = btn
+        for col in range(columns):
+            parent.columnconfigure(col, weight=1)
+        return buttons
+
+    def _hand_button_text(self, target: str, value: int) -> str:
+        count = self.player_cards.count(value) if target == "player" else self.dealer_cards.count(value)
+        return f"{self._card_face(value)}\n({count})"
+
+    def _update_hand_button(self, target: str, value: int) -> None:
+        buttons = self.player_hand_buttons if target == "player" else self.dealer_hand_buttons
+        if value in buttons:
+            buttons[value].configure(text=self._hand_button_text(target, value))
+
+    def _refresh_hand_buttons(self, target: str, values: Iterable[int] | None = None) -> None:
+        if values is None:
+            values = CARD_VALUES
+        for value in values:
+            self._update_hand_button(target, value)
+
+    def _card_face(self, value: int) -> str:
+        icon = CARD_ICONS.get(value, CARD_LABELS[value])
+        return f"{icon} {CARD_LABELS[value]}"
+
+    def _calculate_actual_bet(self, units: int) -> float:
+        bankroll = max(self.bankroll_var.get(), 0.0)
+        unit_percent = max(self.unit_percent_var.get(), 0.0)
+        base_bet = bankroll * (unit_percent / 100)
+        if bankroll <= 0 or base_bet <= 0 or units <= 0:
+            return 0.0
+        return min(units * base_bet, bankroll)
+
+    def _format_currency(self, amount: float) -> str:
+        return f"${amount:,.2f}"
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def _sync_ui_from_state(self) -> None:
+        if self.card_buttons:
+            for value in CARD_VALUES:
+                self._update_seen_card_button(value)
+        if hasattr(self, "player_listbox"):
+            self._refresh_listbox(self.player_listbox, self.player_cards)
+            self._refresh_hand_buttons("player")
+        if hasattr(self, "dealer_listbox"):
+            self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
+            self._refresh_hand_buttons("dealer")
+        self._update_hand_summaries()
+
+    def _load_state(self) -> None:
+        self._suspend_state = True
+        if not self._state_path.exists():
+            self._suspend_state = False
+            return
+        try:
+            with self._state_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            self._suspend_state = False
+            return
+
+        self.deck_number_var.set(int(data.get("deck_number", self.deck_number_var.get())))
+        self.max_splits_var.set(int(data.get("max_splits", self.max_splits_var.get())))
+        self.dealer_hits_soft17_var.set(bool(data.get("dealer_hits_soft17", self.dealer_hits_soft17_var.get())))
+        self.dealer_peeks_var.set(bool(data.get("dealer_peeks", self.dealer_peeks_var.get())))
+        self.das_var.set(bool(data.get("das", self.das_var.get())))
+        self.allow_double_var.set(bool(data.get("allow_double", self.allow_double_var.get())))
+        self.allow_insurance_var.set(bool(data.get("allow_insurance", self.allow_insurance_var.get())))
+        self.allow_surrender_var.set(bool(data.get("allow_surrender", self.allow_surrender_var.get())))
+        self.burn_count_var.set(int(data.get("burn_count", self.burn_count_var.get())))
+        try:
+            self.bankroll_var.set(float(data.get("bankroll", self.bankroll_var.get())))
+        except (TypeError, ValueError):
+            self.bankroll_var.set(0.0)
+        try:
+            self.unit_percent_var.set(float(data.get("unit_percent", self.unit_percent_var.get())))
+        except (TypeError, ValueError):
+            self.unit_percent_var.set(1.0)
+
+        counts_data = data.get("cards_seen_counts", {})
+        if isinstance(counts_data, dict):
+            for value in CARD_VALUES:
+                stored = counts_data.get(str(value), counts_data.get(value, 0))
+                try:
+                    self.cards_seen_counts[value] = max(int(stored), 0)
+                except (TypeError, ValueError):
+                    self.cards_seen_counts[value] = 0
+
+        def sanitize_cards(cards: Iterable[int | str]) -> List[int]:
+            valid: List[int] = []
+            for card in cards or []:
+                try:
+                    value = int(card)
+                except (TypeError, ValueError):
+                    continue
+                if value in CARD_VALUES:
+                    valid.append(value)
+            return valid
+
+        self.player_cards = sanitize_cards(data.get("player_cards", []))
+        self.dealer_cards = sanitize_cards(data.get("dealer_cards", []))
+        self._suspend_state = False
+
+    def _save_state(self) -> None:
+        if self._suspend_state:
+            return
+        data = {
+            "deck_number": self.deck_number_var.get(),
+            "max_splits": self.max_splits_var.get(),
+            "dealer_hits_soft17": self.dealer_hits_soft17_var.get(),
+            "dealer_peeks": self.dealer_peeks_var.get(),
+            "das": self.das_var.get(),
+            "allow_double": self.allow_double_var.get(),
+            "allow_insurance": self.allow_insurance_var.get(),
+            "allow_surrender": self.allow_surrender_var.get(),
+            "burn_count": self.burn_count_var.get(),
+            "bankroll": self.bankroll_var.get(),
+            "unit_percent": self.unit_percent_var.get(),
+            "cards_seen_counts": self.cards_seen_counts,
+            "player_cards": self.player_cards,
+            "dealer_cards": self.dealer_cards,
+        }
+        try:
+            with self._state_path.open("w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _state_changed(self) -> None:
+        if self._suspend_state:
+            return
+        self._save_state()
+
+    def _on_rule_toggle(self) -> None:
+        self._update_betting_info()
+        self._state_changed()
+
+    def _double_confirm(self, title: str, message: str) -> bool:
+        if not messagebox.askyesno(title, message):
+            return False
+        return messagebox.askyesno(title, "Please confirm once more.")
+
+    def _confirm_clear_seen_cards(self) -> None:
+        if self._double_confirm("Clear Seen Cards", "Clear all manually logged seen cards?"):
+            self._clear_seen_cards()
+
+    def _confirm_burn_cards(self) -> None:
+        count = self.burn_count_var.get()
+        if self._double_confirm("Burn Cards", f"Remove {count} unseen card(s) at random?"):
+            self._burn_unknown_cards()
+
+    def _confirm_clear_everything(self) -> None:
+        if self._double_confirm("Clear Everything", "Reset hands and seen cards?"):
+            self._clear_all()
+
+    def _apply_dark_theme(self) -> None:
+        self.root.configure(bg=DARK_BG)
+        self.root.tk_setPalette(background=DARK_BG, foreground=TEXT_COLOR, activeBackground=BUTTON_ACTIVE_BG,
+                                activeForeground=TEXT_COLOR, highlightColor=ACCENT_COLOR,
+                                selectBackground=ACCENT_COLOR, selectForeground=TEXT_COLOR,
+                                troughColor=BUTTON_BG)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TFrame", background=PANEL_BG)
+        style.configure("TLabelframe", background=PANEL_BG, foreground=TEXT_COLOR)
+        style.configure("TLabelframe.Label", background=PANEL_BG, foreground=TEXT_COLOR)
+        style.configure("TLabel", background=PANEL_BG, foreground=TEXT_COLOR)
+        style.configure("TCheckbutton", background=PANEL_BG, foreground=TEXT_COLOR)
+        style.configure("TButton", background=BUTTON_BG, foreground=TEXT_COLOR)
+        style.map("TButton",
+               background=[("active", BUTTON_ACTIVE_BG), ("pressed", BUTTON_ACTIVE_BG)],
+               foreground=[("active", TEXT_COLOR), ("pressed", TEXT_COLOR), ("disabled", "#888888")])
+        style.configure("TNotebook", background=PANEL_BG)
+        style.configure("TCheckbutton", background=PANEL_BG, foreground=TEXT_COLOR)
+        style.map("TCheckbutton",
+               foreground=[("active", TEXT_COLOR), ("selected", TEXT_COLOR)],
+               background=[("active", PANEL_BG), ("selected", PANEL_BG)])
+        style.configure("Treeview", background=PANEL_BG, fieldbackground=PANEL_BG, foreground=TEXT_COLOR)
+        style.configure("TMenubutton", background=BUTTON_BG, foreground=TEXT_COLOR)
+        self.style = style
+
+    def _create_dark_button(self, parent: tk.Widget, **kwargs) -> tk.Button:
+        defaults = {
+            "bg": BUTTON_BG,
+            "fg": TEXT_COLOR,
+            "activebackground": BUTTON_ACTIVE_BG,
+            "activeforeground": TEXT_COLOR,
+            "highlightthickness": 0,
+            "borderwidth": 1,
+            "relief": tk.RAISED,
+        }
+        defaults.update(kwargs)
+        return tk.Button(parent, **defaults)
+
+    def _style_entry(self, widget: tk.Widget) -> None:
+        widget.configure(bg=BUTTON_BG, fg=TEXT_COLOR, insertbackground=TEXT_COLOR,
+                         highlightthickness=0, relief=tk.SOLID, borderwidth=1)
+
+    def _style_listbox(self, widget: tk.Listbox) -> None:
+        widget.configure(bg=PANEL_BG, fg=TEXT_COLOR, selectbackground=ACCENT_COLOR,
+                         selectforeground=TEXT_COLOR, highlightbackground=BUTTON_BG,
+                         highlightcolor=BUTTON_ACTIVE_BG, borderwidth=1, relief=tk.SOLID)
+
+
+def main() -> None:
+    root = tk.Tk()
+    gui = BlackjackSimulatorGUI(root)
+    gui.run()
+
+
+if __name__ == "__main__":
+    main()
