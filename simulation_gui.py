@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import tkinter as tk
 from collections import Counter
 from pathlib import Path
@@ -31,6 +32,9 @@ CARD_ICONS: Dict[int, str] = {
     11: "🂡",
 }
 ACTION_LABELS: tuple[str, ...] = ("Stand", "Hit", "Double", "Split", "Surrender")
+CARD_CODE_PATTERN = re.compile(r":\s*((?:10|[2-9]|[TJQKA])[HDCS]?)\s*:", re.IGNORECASE)
+NEGATIVE_COUNT_THRESHOLD = -0.5
+NEGATIVE_COUNT_MIN_BET = 100.0
 
 DARK_BG = "#1e1e1e"
 PANEL_BG = "#252526"
@@ -70,12 +74,15 @@ class BlackjackSimulatorGUI:
         self.dealer_hand_buttons: Dict[int, tk.Button] = {}
         self.burn_count_var = tk.IntVar(value=5)
 
-        self.player_cards: List[int] = []
+        self.player_hands: List[List[int]] = [[]]
         self.dealer_cards: List[int] = []
 
-        self.player_listbox: tk.Listbox
+        self.active_hand_index = 0
+        self.player_notebook: ttk.Notebook | None = None
+        self.player_tab_frames: List[ttk.Frame] = []
+        self.player_listboxes: List[tk.Listbox] = []
         self.dealer_listbox: tk.Listbox
-        self.player_summary_var = tk.StringVar(value="Player total: 0")
+        self.player_summary_var = tk.StringVar(value="Hand 1 total: 0 (cards: 0)")
         self.dealer_summary_var = tk.StringVar(value="Dealer total: 0")
 
         self.best_action_var = tk.StringVar(value="Best action: —")
@@ -84,9 +91,11 @@ class BlackjackSimulatorGUI:
         self.bet_var = tk.StringVar(value="Suggested bet: 1 unit")
         self.counts_var = tk.StringVar(value="Running: +0 | True: +0.00 | Cards left: 0")
         self.status_var = tk.StringVar(value="")
+        self._last_bet_amount = 0.0
 
         self._load_state()
         self._build_layout()
+        self.root.bind("<Button-2>", self._handle_middle_click)
         self._sync_ui_from_state()
         self._register_traces()
         self._update_betting_info()
@@ -184,19 +193,20 @@ class BlackjackSimulatorGUI:
         player_frame = ttk.Frame(container)
         player_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         player_frame.columnconfigure(0, weight=1)
-        player_frame.rowconfigure(1, weight=1)
+        player_frame.rowconfigure(2, weight=1)
         ttk.Label(player_frame, textvariable=self.player_summary_var).grid(row=0, column=0, sticky="w")
-        self.player_listbox = tk.Listbox(player_frame, height=6)
-        self.player_listbox.grid(row=1, column=0, sticky="nsew", pady=4)
-        self._style_listbox(self.player_listbox)
-        ttk.Button(player_frame, text="Remove Selected", command=lambda: self._remove_selected_card("player")) \
-            .grid(row=2, column=0, pady=2, sticky="ew")
-        ttk.Button(player_frame, text="Clear Player", command=lambda: self._clear_hand("player")) \
-            .grid(row=3, column=0, pady=2, sticky="ew")
-        ttk.Label(player_frame, text="Left click a rank to add. Shift/right click to remove.").grid(
-            row=4, column=0, sticky="w", pady=(6, 0))
+        controls = ttk.Frame(player_frame)
+        controls.grid(row=1, column=0, sticky="ew", pady=(2, 2))
+        ttk.Button(controls, text="Add Hand", command=self._add_player_hand).grid(row=0, column=0, padx=(0, 4))
+        ttk.Button(controls, text="Remove Hand", command=self._remove_current_player_hand).grid(row=0, column=1)
+        controls.columnconfigure(2, weight=1)
+        self.player_notebook = ttk.Notebook(player_frame)
+        self.player_notebook.grid(row=2, column=0, sticky="nsew", pady=4)
+        self.player_notebook.bind("<<NotebookTabChanged>>", self._on_player_tab_changed)
+        ttk.Label(player_frame, text="Left click a rank to add to the active hand. Shift/right click to remove.").grid(
+            row=3, column=0, sticky="w", pady=(6, 0))
         player_buttons_frame = ttk.Frame(player_frame)
-        player_buttons_frame.grid(row=5, column=0, sticky="ew")
+        player_buttons_frame.grid(row=4, column=0, sticky="ew")
         self.player_hand_buttons = self._build_hand_card_buttons(player_buttons_frame, "player")
 
         dealer_frame = ttk.Frame(container)
@@ -216,6 +226,69 @@ class BlackjackSimulatorGUI:
         dealer_buttons_frame = ttk.Frame(dealer_frame)
         dealer_buttons_frame.grid(row=5, column=0, sticky="ew")
         self.dealer_hand_buttons = self._build_hand_card_buttons(dealer_buttons_frame, "dealer")
+        self._rebuild_player_tabs()
+
+    def _rebuild_player_tabs(self) -> None:
+        if not self.player_notebook:
+            return
+        if not self.player_hands:
+            self.player_hands = [[]]
+        for frame in self.player_tab_frames:
+            self.player_notebook.forget(frame)
+            frame.destroy()
+        self.player_tab_frames = []
+        self.player_listboxes = []
+        for idx in range(len(self.player_hands)):
+            self._create_player_hand_tab(idx)
+        self.active_hand_index = min(self.active_hand_index, len(self.player_hands) - 1)
+        if self.player_tab_frames:
+            self.player_notebook.select(self.player_tab_frames[self.active_hand_index])
+        self._update_hand_summaries()
+
+    def _create_player_hand_tab(self, index: int) -> None:
+        if not self.player_notebook:
+            return
+        frame = ttk.Frame(self.player_notebook)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        listbox = tk.Listbox(frame, height=6)
+        listbox.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        self._style_listbox(listbox)
+        remove_btn = ttk.Button(frame, text="Remove Selected",
+                                command=lambda idx=index: self._remove_selected_card("player", idx))
+        remove_btn.grid(row=1, column=0, sticky="ew", pady=2)
+        clear_btn = ttk.Button(frame, text="Clear Hand",
+                               command=lambda idx=index: self._clear_hand("player", idx))
+        clear_btn.grid(row=2, column=0, sticky="ew", pady=2)
+        self.player_notebook.add(frame, text=f"Hand {index + 1}")
+        self.player_tab_frames.append(frame)
+        self.player_listboxes.append(listbox)
+        self._refresh_listbox(listbox, self.player_hands[index])
+
+    def _on_player_tab_changed(self, _: object) -> None:
+        if not self.player_notebook:
+            return
+        self.active_hand_index = self.player_notebook.index("current")
+        self._refresh_hand_buttons("player")
+        self._update_hand_summaries()
+
+    def _add_player_hand(self) -> None:
+        self.player_hands.append([])
+        self.active_hand_index = len(self.player_hands) - 1
+        self._rebuild_player_tabs()
+        self._state_changed()
+
+    def _remove_current_player_hand(self) -> None:
+        if len(self.player_hands) <= 1:
+            self._set_status("At least one player hand is required.")
+            return
+        removed_idx = self.active_hand_index
+        self.player_hands.pop(removed_idx)
+        self.active_hand_index = min(removed_idx, len(self.player_hands) - 1)
+        self._rebuild_player_tabs()
+        self._update_betting_info()
+        self._state_changed()
+        self._set_status(f"Removed Hand {removed_idx + 1}.")
 
     def _build_actions_section(self) -> None:
         frame = ttk.Frame(self.root)
@@ -237,6 +310,113 @@ class BlackjackSimulatorGUI:
         ttk.Label(frame, textvariable=self.bet_var).grid(row=3, column=0, sticky="w", pady=2)
         ttk.Label(frame, textvariable=self.counts_var).grid(row=4, column=0, sticky="w", pady=2)
 
+    def _handle_middle_click(self, _: object) -> None:
+        self._import_hands_from_clipboard()
+
+    def _import_hands_from_clipboard(self) -> None:
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except tk.TclError:
+            self._set_status("Clipboard unavailable.")
+            return
+        if not clipboard_text.strip():
+            self._set_status("Clipboard is empty.")
+            return
+        try:
+            player_hands, dealer_cards = self._parse_clipboard_hands(clipboard_text)
+            self._validate_import_capacity(player_hands, dealer_cards)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        if not any(player_hands):
+            self._set_status("Clipboard player hand has no cards.")
+            return
+        if not dealer_cards:
+            self._set_status("Clipboard dealer hand has no cards.")
+            return
+        self.player_hands = [hand[:] for hand in player_hands] or [[]]
+        self.active_hand_index = 0
+        self.dealer_cards = dealer_cards
+        self._rebuild_player_tabs()
+        self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
+        self._refresh_hand_buttons("player")
+        self._refresh_hand_buttons("dealer")
+        self._update_hand_summaries()
+        self._update_betting_info()
+        self._state_changed()
+        self._set_status("Hands imported from clipboard.")
+        self.root.after_idle(self._simulate)
+
+    def _parse_clipboard_hands(self, text: str) -> tuple[List[List[int]], List[int]]:
+        lower = text.lower()
+        dealer_idx = lower.find("dealer hand")
+        if dealer_idx == -1:
+            raise ValueError("Clipboard text must include 'Dealer Hand'.")
+        player_block = text[:dealer_idx]
+        dealer_block = text[dealer_idx:]
+        player_blocks = self._extract_player_blocks(player_block)
+        player_hands = [self._extract_cards_from_block(block) for block in player_blocks]
+        player_hands = [hand for hand in player_hands if hand]
+        if not player_hands:
+            raise ValueError("Clipboard player hand has no cards.")
+        return player_hands, self._extract_cards_from_block(dealer_block)
+
+    def _extract_player_blocks(self, text: str) -> List[str]:
+        matches = list(re.finditer(r"\bhand\s*\d+", text, re.IGNORECASE))
+        if matches:
+            blocks: List[str] = []
+            for idx, match in enumerate(matches):
+                start = match.end()
+                end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                blocks.append(text[start:end])
+            return blocks
+        lower = text.lower()
+        player_idx = lower.find("your hand")
+        if player_idx != -1:
+            return [text[player_idx:]]
+        return [text]
+
+    def _extract_cards_from_block(self, block: str) -> List[int]:
+        cards: List[int] = []
+        for token in CARD_CODE_PATTERN.findall(block):
+            token = token.strip()
+            if not token:
+                continue
+            value = self._card_value_from_code(token)
+            if value is not None:
+                cards.append(value)
+        return cards
+
+    def _card_value_from_code(self, code: str) -> int | None:
+        normalized = code.strip().upper()
+        if not normalized:
+            return None
+        cleaned = normalized.replace(" ", "")
+        if len(cleaned) > 1 and cleaned[-1] in "HDCS":
+            rank = cleaned[:-1]
+        else:
+            rank = cleaned
+        rank_map = {"A": 11, "K": 10, "Q": 10, "J": 10, "T": 10}
+        if rank.isdigit():
+            value = int(rank)
+        else:
+            value = rank_map.get(rank)
+        if value not in CARD_VALUES:
+            return None
+        return value
+
+    def _validate_import_capacity(self, player_hands: List[List[int]], dealer_cards: List[int]) -> None:
+        combined: Counter[int] = Counter()
+        for hand in player_hands:
+            combined.update(hand)
+        combined.update(dealer_cards)
+        for value, amount in combined.items():
+            capacity = self._total_card_capacity(value)
+            manual = self.cards_seen_counts[value]
+            if manual + amount > capacity:
+                label = CARD_LABELS[value]
+                raise ValueError(f"Not enough {label} cards remaining for clipboard import.")
+
     def _seen_card_text(self, value: int) -> str:
         return f"{self._card_face(value)}\n({self.cards_seen_counts[value]})"
 
@@ -257,7 +437,7 @@ class BlackjackSimulatorGUI:
 
     def _max_manual_seen_count(self, value: int) -> int:
         capacity = self._total_card_capacity(value)
-        used_in_hands = self.player_cards.count(value) + self.dealer_cards.count(value)
+        used_in_hands = self._all_player_cards().count(value) + self.dealer_cards.count(value)
         return max(capacity - used_in_hands, 0)
 
     def _total_card_capacity(self, value: int) -> int:
@@ -301,48 +481,86 @@ class BlackjackSimulatorGUI:
         self._set_status(f"Burned cards: {summary}")
         self._state_changed()
 
-    def _modify_hand_card(self, target: str, value: int, delta: int) -> None:
-        if delta > 0:
-            self._add_card_to_hand(target, value)
-        else:
-            self._remove_card_by_value(target, value)
+    def _resolve_hand_index(self, hand_index: int | None) -> int:
+        if not self.player_hands:
+            self.player_hands = [[]]
+        if hand_index is not None and 0 <= hand_index < len(self.player_hands):
+            return hand_index
+        return min(self.active_hand_index, len(self.player_hands) - 1)
 
-    def _add_card_to_hand(self, target: str, value: int) -> None:
+    def _current_player_hand(self) -> List[int]:
+        idx = self._resolve_hand_index(self.active_hand_index)
+        return self.player_hands[idx]
+
+    def _all_player_cards(self) -> List[int]:
+        return [card for hand in self.player_hands for card in hand]
+
+    def _refresh_player_listbox(self, hand_index: int) -> None:
+        if 0 <= hand_index < len(self.player_listboxes):
+            self._refresh_listbox(self.player_listboxes[hand_index], self.player_hands[hand_index])
+
+    def _modify_hand_card(self, target: str, value: int, delta: int, hand_index: int | None = None) -> None:
+        if delta > 0:
+            self._add_card_to_hand(target, value, hand_index)
+        else:
+            self._remove_card_by_value(target, value, hand_index)
+
+    def _add_card_to_hand(self, target: str, value: int, hand_index: int | None = None) -> None:
         capacity = self._total_card_capacity(value)
         manual_seen = self.cards_seen_counts[value]
-        hand_count = self.player_cards.count(value) + self.dealer_cards.count(value)
+        hand_count = self._all_player_cards().count(value) + self.dealer_cards.count(value)
         if manual_seen + hand_count >= capacity:
             self._set_status(f"All {CARD_LABELS[value]} cards already accounted for.")
             return
         if target == "player":
-            self.player_cards.append(value)
-            self._refresh_listbox(self.player_listbox, self.player_cards)
-            self._update_hand_button("player", value)
+            idx = self._resolve_hand_index(hand_index)
+            self.player_hands[idx].append(value)
+            self._refresh_player_listbox(idx)
+            if idx == self.active_hand_index:
+                self._update_hand_button("player", value)
+            self._update_player_summary(idx)
         else:
             self.dealer_cards.append(value)
             self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
             self._update_hand_button("dealer", value)
-        self._update_hand_summaries()
+            self._update_dealer_summary()
         self._update_betting_info()
         self._state_changed()
 
-    def _remove_card_by_value(self, target: str, value: int) -> None:
-        cards = self.player_cards if target == "player" else self.dealer_cards
-        for idx in range(len(cards) - 1, -1, -1):
-            if cards[idx] == value:
-                cards.pop(idx)
-                listbox = self.player_listbox if target == "player" else self.dealer_listbox
-                self._refresh_listbox(listbox, cards)
+    def _remove_card_by_value(self, target: str, value: int, hand_index: int | None = None) -> None:
+        if target == "player":
+            idx = self._resolve_hand_index(hand_index)
+            cards = self.player_hands[idx]
+            listbox = self.player_listboxes[idx] if idx < len(self.player_listboxes) else None
+        else:
+            cards = self.dealer_cards
+            listbox = self.dealer_listbox
+        for pos in range(len(cards) - 1, -1, -1):
+            if cards[pos] == value:
+                cards.pop(pos)
+                if listbox is not None:
+                    self._refresh_listbox(listbox, cards)
                 self._update_hand_button(target, value)
-                self._update_hand_summaries()
+                if target == "player":
+                    self._update_player_summary(idx)
+                else:
+                    self._update_dealer_summary()
                 self._update_betting_info()
                 self._state_changed()
                 return
         self._set_status(f"No {CARD_LABELS[value]} cards to remove from {target} hand.")
 
-    def _remove_selected_card(self, target: str) -> None:
-        listbox = self.player_listbox if target == "player" else self.dealer_listbox
-        cards = self.player_cards if target == "player" else self.dealer_cards
+    def _remove_selected_card(self, target: str, hand_index: int | None = None) -> None:
+        if target == "player":
+            idx = self._resolve_hand_index(hand_index)
+            if idx >= len(self.player_listboxes):
+                return
+            listbox = self.player_listboxes[idx]
+            cards = self.player_hands[idx]
+        else:
+            listbox = self.dealer_listbox
+            cards = self.dealer_cards
+            idx = None
         selection = listbox.curselection()
         if not selection:
             return
@@ -353,15 +571,24 @@ class BlackjackSimulatorGUI:
                 changed = True
         self._refresh_listbox(listbox, cards)
         self._refresh_hand_buttons(target)
-        self._update_hand_summaries()
+        if target == "player" and idx is not None:
+            self._update_player_summary(idx)
+        else:
+            self._update_dealer_summary()
         self._update_betting_info()
         if changed:
             self._state_changed()
 
-    def _clear_hand(self, target: str) -> None:
+    def _clear_hand(self, target: str, hand_index: int | None = None) -> None:
         if target == "player":
-            self.player_cards.clear()
-            self._refresh_listbox(self.player_listbox, self.player_cards)
+            if hand_index is None:
+                self.player_hands = [[]]
+                self.active_hand_index = 0
+                self._rebuild_player_tabs()
+            else:
+                idx = self._resolve_hand_index(hand_index)
+                self.player_hands[idx].clear()
+                self._refresh_player_listbox(idx)
             self._refresh_hand_buttons("player")
         else:
             self.dealer_cards.clear()
@@ -377,7 +604,27 @@ class BlackjackSimulatorGUI:
             listbox.insert(tk.END, CARD_LABELS[card])
 
     def _update_hand_summaries(self) -> None:
-        self.player_summary_var.set(f"Player total: {self._hand_value(self.player_cards)} (cards: {len(self.player_cards)})")
+        for idx in range(len(self.player_hands)):
+            self._update_player_summary(idx)
+        self._update_dealer_summary()
+
+    def _update_player_summary(self, hand_index: int) -> None:
+        if not self.player_hands:
+            return
+        if hand_index >= len(self.player_hands):
+            return
+        cards = self.player_hands[hand_index]
+        total = self._hand_value(cards)
+        label = f"Hand {hand_index + 1} total: {total} (cards: {len(cards)})"
+        if hand_index == self.active_hand_index:
+            self.player_summary_var.set(label)
+        if self.player_notebook and hand_index < len(self.player_tab_frames):
+            tab_label = f"Hand {hand_index + 1}"
+            if cards:
+                tab_label += f" ({total})"
+            self.player_notebook.tab(self.player_tab_frames[hand_index], text=tab_label)
+
+    def _update_dealer_summary(self) -> None:
         dealer_total = self._hand_value(self.dealer_cards)
         self.dealer_summary_var.set(f"Dealer total: {dealer_total} (cards: {len(self.dealer_cards)})")
 
@@ -399,10 +646,11 @@ class BlackjackSimulatorGUI:
         self.status_var.set("")
 
     def _record_game_end(self) -> None:
-        if not self.player_cards and not self.dealer_cards:
+        all_player_cards = self._all_player_cards()
+        if not all_player_cards and not self.dealer_cards:
             self._set_status("Nothing to record. Add cards first.")
             return
-        moved_cards = self.player_cards + self.dealer_cards
+        moved_cards = all_player_cards + self.dealer_cards
         for card in moved_cards:
             self.cards_seen_counts[card] += 1
             self._update_seen_card_button(card)
@@ -412,7 +660,8 @@ class BlackjackSimulatorGUI:
         self._state_changed()
 
     def _simulate(self) -> None:
-        if not self.player_cards:
+        active_indices = [idx for idx, hand in enumerate(self.player_hands) if hand]
+        if not active_indices:
             messagebox.showerror("Missing data", "Add at least one player card before simulating.")
             return
         if not self.dealer_cards:
@@ -424,24 +673,28 @@ class BlackjackSimulatorGUI:
             messagebox.showerror("Invalid shoe", str(exc))
             return
         dealer_up_card = self.dealer_cards[0]
-        try:
-            profits = perfect_mover_cache(
-                cards=tuple(self.player_cards),
-                dealer_up_card=dealer_up_card,
-                cards_not_seen=cards_not_seen,
-                can_double=self.allow_double_var.get(),
-                can_insure=self.allow_insurance_var.get(),
-                can_surrender=self.allow_surrender_var.get(),
-                max_splits=self.max_splits_var.get(),
-                dealer_peeks_for_blackjack=self.dealer_peeks_var.get(),
-                das=self.das_var.get(),
-                dealer_stands_soft_17=not self.dealer_hits_soft17_var.get(),
-                return_all_profits=True,
-            )
-        except Exception as exc:  # pragma: no cover - safeguard for unexpected runtime issues
-            messagebox.showerror("Simulation error", str(exc))
-            return
-        self._display_results(profits)
+        hand_results: List[tuple[int, List[int], tuple[float, ...]]] = []
+        for idx in active_indices:
+            hand = self.player_hands[idx]
+            try:
+                profits = perfect_mover_cache(
+                    cards=tuple(hand),
+                    dealer_up_card=dealer_up_card,
+                    cards_not_seen=cards_not_seen,
+                    can_double=self.allow_double_var.get(),
+                    can_insure=self.allow_insurance_var.get(),
+                    can_surrender=self.allow_surrender_var.get(),
+                    max_splits=self.max_splits_var.get(),
+                    dealer_peeks_for_blackjack=self.dealer_peeks_var.get(),
+                    das=self.das_var.get(),
+                    dealer_stands_soft_17=not self.dealer_hits_soft17_var.get(),
+                    return_all_profits=True,
+                )
+            except Exception as exc:  # pragma: no cover - safeguard for unexpected runtime issues
+                messagebox.showerror("Simulation error", str(exc))
+                return
+            hand_results.append((idx, list(hand), profits))
+        self._display_results(hand_results)
 
     def _build_cards_not_seen(self) -> tuple[int, ...]:
         deck_number = self.deck_number_var.get()
@@ -462,22 +715,41 @@ class BlackjackSimulatorGUI:
         for value, count in self.cards_seen_counts.items():
             cards.extend([value] * count)
         if include_hands:
-            cards.extend(self.player_cards)
+            for hand in self.player_hands:
+                cards.extend(hand)
             cards.extend(self.dealer_cards)
         return cards
 
-    def _display_results(self, profits: tuple[float, ...]) -> None:
-        action_profits = profits[:5]
-        insurance_profit = profits[5] if len(profits) > 5 else float("nan")
-        best_index = max(range(len(action_profits)), key=lambda idx: action_profits[idx])
-        best_action = ACTION_LABELS[best_index]
-        best_value = action_profits[best_index]
-        self.best_action_var.set(f"Best action: {best_action} (EV: {best_value:+.3f})")
-        breakdown_parts = [f"{label}: {value:+.3f}" for label, value in zip(ACTION_LABELS, action_profits)]
-        self.ev_breakdown_var.set(", ".join(breakdown_parts))
-        insurance_text = f"Insurance EV: {insurance_profit:+.3f} (" + ("Take" if insurance_profit > 0 else "Skip") + ")"
-        self.insurance_var.set(insurance_text)
+    def _display_results(self, hand_results: List[tuple[int, List[int], tuple[float, ...]]]) -> None:
+        if not hand_results:
+            return
+        best_lines: List[str] = []
+        breakdown_lines: List[str] = []
+        insurance_value: float | None = None
+        for hand_idx, _, profits in hand_results:
+            action_profits = profits[:5]
+            if len(profits) > 5 and insurance_value is None:
+                insurance_value = profits[5]
+            best_index = max(range(len(action_profits)), key=lambda idx: action_profits[idx])
+            best_action = ACTION_LABELS[best_index]
+            best_value = action_profits[best_index]
+            best_lines.append(f"Hand {hand_idx + 1}: {best_action} (EV: {best_value:+.3f})")
+            breakdown = ", ".join(f"{label}: {value:+.3f}" for label, value in zip(ACTION_LABELS, action_profits))
+            breakdown_lines.append(f"Hand {hand_idx + 1}: {breakdown}")
+        if len(hand_results) == 1:
+            # Strip the "Hand 1:" prefix for brevity
+            best_action_text = best_lines[0].split(": ", 1)[1]
+            self.best_action_var.set(f"Best action: {best_action_text}")
+        else:
+            self.best_action_var.set("Best actions:\n" + "\n".join(best_lines))
+        self.ev_breakdown_var.set("\n".join(breakdown_lines))
+        if insurance_value is None or insurance_value != insurance_value:  # NaN guard
+            self.insurance_var.set("Insurance EV: –")
+        else:
+            insurance_text = f"Insurance EV: {insurance_value:+.3f} (" + ("Take" if insurance_value > 0 else "Skip") + ")"
+            self.insurance_var.set(insurance_text)
         self._set_status("Simulation complete.")
+        self._copy_next_bet_command()
 
     def _update_betting_info(self) -> None:
         cards_seen = self._get_total_seen_cards(include_hands=True)
@@ -490,13 +762,21 @@ class BlackjackSimulatorGUI:
         except ZeroDivisionError:
             bet_units = 0
         actual_bet = self._calculate_actual_bet(bet_units)
-        if bet_units == 0:
+        forced_min = False
+        if true_count < NEGATIVE_COUNT_THRESHOLD:
+            bankroll = max(self.bankroll_var.get(), 0.0)
+            actual_bet = min(NEGATIVE_COUNT_MIN_BET, bankroll) if bankroll > 0 else 0.0
+            forced_min = actual_bet > 0
+        if forced_min:
+            bet_text = f"Suggested bet: Table min (~{self._format_currency(actual_bet)})"
+        elif bet_units == 0:
             bet_text = "Suggested bet: Sit out"
         else:
             approx_text = f" (~{self._format_currency(actual_bet)})" if actual_bet > 0 else ""
             bet_text = f"Suggested bet: {bet_units} unit{'s' if bet_units != 1 else ''}{approx_text}"
         self.bet_var.set(bet_text)
         self.counts_var.set(f"Running: {running:+} | True: {true_count:+.2f} | Cards left: {max(cards_left, 0)}")
+        self._last_bet_amount = actual_bet
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -575,7 +855,11 @@ class BlackjackSimulatorGUI:
         return buttons
 
     def _hand_button_text(self, target: str, value: int) -> str:
-        count = self.player_cards.count(value) if target == "player" else self.dealer_cards.count(value)
+        if target == "player":
+            hand = self._current_player_hand()
+            count = hand.count(value)
+        else:
+            count = self.dealer_cards.count(value)
         return f"{self._card_face(value)}\n({count})"
 
     def _update_hand_button(self, target: str, value: int) -> None:
@@ -604,6 +888,15 @@ class BlackjackSimulatorGUI:
     def _format_currency(self, amount: float) -> str:
         return f"${amount:,.2f}"
 
+    def _copy_next_bet_command(self) -> None:
+        amount = int(round(max(self._last_bet_amount, 0.0)))
+        command = f"$bj {amount}"
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(command)
+        except tk.TclError:
+            self._set_status("Could not copy bet command to clipboard.")
+
     def run(self) -> None:
         self.root.mainloop()
 
@@ -611,8 +904,8 @@ class BlackjackSimulatorGUI:
         if self.card_buttons:
             for value in CARD_VALUES:
                 self._update_seen_card_button(value)
-        if hasattr(self, "player_listbox"):
-            self._refresh_listbox(self.player_listbox, self.player_cards)
+        if self.player_notebook:
+            self._rebuild_player_tabs()
             self._refresh_hand_buttons("player")
         if hasattr(self, "dealer_listbox"):
             self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
@@ -669,7 +962,19 @@ class BlackjackSimulatorGUI:
                     valid.append(value)
             return valid
 
-        self.player_cards = sanitize_cards(data.get("player_cards", []))
+        player_hands_data = data.get("player_hands")
+        if isinstance(player_hands_data, list):
+            parsed_hands = [sanitize_cards(hand) for hand in player_hands_data]
+            self.player_hands = parsed_hands or [[]]
+        else:
+            self.player_hands = [sanitize_cards(data.get("player_cards", []))]
+            if not self.player_hands:
+                self.player_hands = [[]]
+        try:
+            active_idx = int(data.get("active_hand_index", 0))
+        except (TypeError, ValueError):
+            active_idx = 0
+        self.active_hand_index = min(max(active_idx, 0), len(self.player_hands) - 1)
         self.dealer_cards = sanitize_cards(data.get("dealer_cards", []))
         self._suspend_state = False
 
@@ -689,8 +994,9 @@ class BlackjackSimulatorGUI:
             "bankroll": self.bankroll_var.get(),
             "unit_percent": self.unit_percent_var.get(),
             "cards_seen_counts": self.cards_seen_counts,
-            "player_cards": self.player_cards,
+            "player_hands": self.player_hands,
             "dealer_cards": self.dealer_cards,
+            "active_hand_index": self.active_hand_index,
         }
         try:
             with self._state_path.open("w", encoding="utf-8") as handle:

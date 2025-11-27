@@ -2,26 +2,34 @@
   "deck_number": 3,
   "max_splits": 2,
   "dealer_hits_soft17": false,
-  "dealer_peeks": true,
+  "dealer_peeks": false,
   "das": false,
   "allow_double": true,
   "allow_insurance": false,
   "allow_surrender": false,
   "burn_count": 1,
-  "bankroll": 170000.0,
+  "bankroll": 70000.0,
   "unit_percent": 0.5,
   "cards_seen_counts": {
-    "2": 4,
-    "3": 0,
-    "4": 0,
-    "5": 1,
-    "6": 0,
-    "7": 1,
-    "8": 1,
-    "9": 1,
-    "10": 3,
-    "11": 0
+    "2": 8,
+    "3": 7,
+    "4": 6,
+    "5": 4,
+    "6": 7,
+    "7": 6,
+    "8": 7,
+    "9": 8,
+    "10": 32,
+    "11": 9
   },
-  "player_cards": [],
-  "dealer_cards": []
+  "player_hands": [
+    [
+      4,
+      10
+    ]
+  ],
+  "dealer_cards": [
+    10
+  ],
+  "active_hand_index": 0
 }
