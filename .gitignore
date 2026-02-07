@@ -8,3 +8,4 @@ test/__pycache__
 docs/build
 other
 .coverage
+simulation_state.json
