@@ -45,7 +45,7 @@ class CardCountBetter(BaseBetter):
         :return: How much money to bet.
         """
         running_count = get_hilo_running_count(cards_seen)
-        cards_left = deck_number * 52 - len(cards_seen) - 1
+        cards_left = deck_number * 52 - len(cards_seen)
         true_count = running_count / (cards_left / 52)
         if true_count >= 1:
             return max(min(int(true_count ** 2 / 2), 15), 1)
@@ -65,7 +65,7 @@ class ConservativeCardCountBetter(BaseBetter):
         :return: How much money to bet.
         """
         running_count = get_hilo_running_count(cards_seen)
-        cards_left = deck_number * 52 - len(cards_seen) - 1
+        cards_left = deck_number * 52 - len(cards_seen)
         true_count = running_count / (cards_left / 52)
         if true_count >= 1:
             return max(min(int(true_count), 5), 1)
@@ -85,7 +85,7 @@ class WongingCardCountBetter(BaseBetter):
         :return: How much money to bet.
         """
         running_count = get_hilo_running_count(cards_seen)
-        cards_left = deck_number * 52 - len(cards_seen) - 1
+        cards_left = deck_number * 52 - len(cards_seen)
         true_count = running_count / (cards_left / 52)
         if true_count >= 1:
             return max(min(int(true_count ** 2 / 2), 15), 1)
@@ -105,7 +105,7 @@ class WongingConservativeCardCountBetter(BaseBetter):
         :return: How much money to bet.
         """
         running_count = get_hilo_running_count(cards_seen)
-        cards_left = deck_number * 52 - len(cards_seen) - 1
+        cards_left = deck_number * 52 - len(cards_seen)
         true_count = running_count / (cards_left / 52)
         if true_count >= 1:
             return max(min(int(true_count), 5), 1)
