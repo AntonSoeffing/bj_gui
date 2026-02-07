@@ -13,6 +13,9 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Dict, Iterable, List
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
 from betting_strategies import CardCountBetter
 from best_move import perfect_mover_cache
 from utils import DECK, get_hilo_running_count
@@ -35,6 +38,7 @@ ACTION_LABELS: tuple[str, ...] = ("Stand", "Hit", "Double", "Split", "Surrender"
 CARD_CODE_PATTERN = re.compile(r":\s*((?:10|[2-9]|[TJQKA])[HDCS]?)\s*:", re.IGNORECASE)
 NEGATIVE_COUNT_THRESHOLD = -0.5
 NEGATIVE_COUNT_MIN_BET = 100.0
+STATS_HISTORY_LIMIT = 500
 
 DARK_BG = "#1e1e1e"
 PANEL_BG = "#252526"
@@ -42,6 +46,16 @@ BUTTON_BG = "#3a3d41"
 BUTTON_ACTIVE_BG = "#005a9e"
 TEXT_COLOR = "#f3f3f3"
 ACCENT_COLOR = "#0a84ff"
+BEST_ACTION_BG = "#111a2c"
+BEST_ACTION_BORDER = "#1f6feb"
+INFO_PANEL_BG = "#1b2233"
+ACTION_COLORS = {
+    "Stand": "#4caf50",
+    "Hit": "#3ea4ff",
+    "Double": "#ff5c5c",
+    "Split": "#f6c945",
+    "Surrender": "#c2c8d3",
+}
 STATE_FILE = Path(__file__).with_name("simulation_state.json")
 
 
@@ -86,12 +100,22 @@ class BlackjackSimulatorGUI:
         self.dealer_summary_var = tk.StringVar(value="Dealer total: 0")
 
         self.best_action_var = tk.StringVar(value="Best action: —")
+        self.best_action_label: tk.Label | None = None
         self.ev_breakdown_var = tk.StringVar(value="Stand: –, Hit: –, Double: –, Split: –, Surrender: –")
         self.insurance_var = tk.StringVar(value="Insurance EV: –")
         self.bet_var = tk.StringVar(value="Suggested bet: 1 unit")
         self.counts_var = tk.StringVar(value="Running: +0 | True: +0.00 | Cards left: 0")
         self.status_var = tk.StringVar(value="")
         self._last_bet_amount = 0.0
+        self._round_bet_amount: float | None = None
+        self.round_doubled_var = tk.BooleanVar(value=False)
+        self._double_check_btn: ttk.Checkbutton | None = None
+        self.session_stats = self._default_stats()
+        self.stats_summary_var = tk.StringVar(value="Games: 0 | Win rate: 0.0% | Net: $0.00")
+        self._stats_fig: Figure | None = None
+        self._stats_canvas: FigureCanvasTkAgg | None = None
+        self._winrate_ax = None
+        self._profit_ax = None
 
         self._load_state()
         self._build_layout()
@@ -99,6 +123,8 @@ class BlackjackSimulatorGUI:
         self._sync_ui_from_state()
         self._register_traces()
         self._update_betting_info()
+        self._update_stats_summary()
+        self._update_stats_plot()
         self._state_changed()
 
     def _build_layout(self) -> None:
@@ -110,6 +136,7 @@ class BlackjackSimulatorGUI:
         self._build_hand_section()
         self._build_actions_section()
         self._build_results_section()
+        self._build_stats_section()
 
     def _register_traces(self) -> None:
         self.deck_number_var.trace_add("write", self._handle_deck_change)
@@ -160,7 +187,7 @@ class BlackjackSimulatorGUI:
         frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
         frame.columnconfigure(tuple(range(11)), weight=1)
 
-        info = ("Left click adds. Shift+Click or right click removes. Use 'Game Ended' to log both hands here automatically.")
+        info = ("Left click adds. Shift+Click or right click removes. Use the result buttons to log both hands automatically.")
         ttk.Label(frame, text=info, wraplength=600).grid(row=0, column=0, columnspan=11, pady=(0, 6), sticky="w")
 
         for idx, value in enumerate(CARD_VALUES):
@@ -293,22 +320,124 @@ class BlackjackSimulatorGUI:
     def _build_actions_section(self) -> None:
         frame = ttk.Frame(self.root)
         frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
-        frame.columnconfigure(2, weight=1)
+        frame.columnconfigure(4, weight=1)
         ttk.Button(frame, text="Run Simulation", command=self._simulate).grid(row=0, column=0, padx=4, pady=4)
-        ttk.Button(frame, text="Game Ended", command=self._record_game_end).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(frame, text="Clear Everything", command=self._confirm_clear_everything).grid(row=0, column=2, padx=4, pady=4, sticky="w")
-        ttk.Label(frame, textvariable=self.status_var, foreground="gray").grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Button(frame, text="Game Ended (Push)", command=lambda: self._record_game_result("push")) \
+            .grid(row=0, column=1, padx=4, pady=4)
+        ttk.Button(frame, text="Game Won", command=lambda: self._record_game_result("win")) \
+            .grid(row=0, column=2, padx=4, pady=4)
+        ttk.Button(frame, text="Game Lost", command=lambda: self._record_game_result("loss")) \
+            .grid(row=0, column=3, padx=4, pady=4)
+        ttk.Button(frame, text="Clear Everything", command=self._confirm_clear_everything) \
+            .grid(row=0, column=4, padx=4, pady=4, sticky="w")
+        ttk.Label(frame, textvariable=self.status_var, foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w")
 
     def _build_results_section(self) -> None:
         frame = ttk.LabelFrame(self.root, text="Results & Betting")
         frame.grid(row=4, column=0, padx=10, pady=10, sticky="ew")
         frame.columnconfigure(0, weight=1)
-        ttk.Label(frame, textvariable=self.best_action_var, font=("TkDefaultFont", 12, "bold")) \
-            .grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Label(frame, textvariable=self.ev_breakdown_var).grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Label(frame, textvariable=self.insurance_var).grid(row=2, column=0, sticky="w", pady=2)
-        ttk.Label(frame, textvariable=self.bet_var).grid(row=3, column=0, sticky="w", pady=2)
-        ttk.Label(frame, textvariable=self.counts_var).grid(row=4, column=0, sticky="w", pady=2)
+        best_frame = tk.Frame(frame, bg=BEST_ACTION_BG, highlightbackground=BEST_ACTION_BORDER,
+                              highlightcolor=BEST_ACTION_BORDER, highlightthickness=1, bd=0)
+        best_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        best_frame.columnconfigure(0, weight=1)
+        self.best_action_label = tk.Label(
+            best_frame,
+            textvariable=self.best_action_var,
+            font=("Segoe UI", 18, "bold"),
+            bg=BEST_ACTION_BG,
+            fg=ACCENT_COLOR,
+            anchor="w",
+            justify="left",
+            wraplength=620,
+            padx=8,
+            pady=8,
+        )
+        self.best_action_label.grid(row=0, column=0, sticky="ew")
+        self._set_best_action_display(self.best_action_var.get())
+
+        info_frame = tk.Frame(frame, bg=INFO_PANEL_BG, bd=0, padx=8, pady=6)
+        info_frame.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        info_frame.columnconfigure(0, weight=1)
+        info_labels = (
+            (self.ev_breakdown_var, "left"),
+            (self.insurance_var, "left"),
+            (self.bet_var, "left"),
+            (self.counts_var, "left"),
+        )
+        for idx, (var, justify) in enumerate(info_labels):
+            tk.Label(
+                info_frame,
+                textvariable=var,
+                bg=INFO_PANEL_BG,
+                fg=TEXT_COLOR,
+                anchor="w",
+                justify=justify,
+                wraplength=640,
+            ).grid(row=idx, column=0, sticky="ew", pady=2)
+
+        self._build_round_multiplier_controls(frame)
+
+    def _set_best_action_display(self, text: str, primary_action: str | None = None) -> None:
+        self.best_action_var.set(text)
+        if not self.best_action_label:
+            return
+        color = ACTION_COLORS.get(primary_action or "", ACCENT_COLOR)
+        self.best_action_label.configure(fg=color)
+
+    def _build_stats_section(self) -> None:
+        frame = ttk.LabelFrame(self.root, text="Session Tracking")
+        frame.grid(row=5, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=0)
+        ttk.Label(frame, textvariable=self.stats_summary_var).grid(row=0, column=0, sticky="w")
+        ttk.Button(frame, text="Reset Stats", command=self._confirm_reset_stats).grid(row=0, column=1, sticky="e", padx=4)
+        self._stats_fig = Figure(figsize=(6.5, 3.5), dpi=100)
+        self._stats_fig.patch.set_facecolor(PANEL_BG)
+        self._winrate_ax = self._stats_fig.add_subplot(211)
+        self._profit_ax = self._stats_fig.add_subplot(212)
+        self._style_stats_axis(self._winrate_ax, "Win %")
+        self._style_stats_axis(self._profit_ax, "Net $", xlabel="Games logged")
+        widget = ttk.Frame(frame)
+        widget.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        widget.columnconfigure(0, weight=1)
+        widget.rowconfigure(0, weight=1)
+        self._stats_canvas = FigureCanvasTkAgg(self._stats_fig, master=widget)
+        canvas_widget = self._stats_canvas.get_tk_widget()
+        canvas_widget.configure(bg=PANEL_BG)
+        canvas_widget.grid(row=0, column=0, sticky="nsew")
+        frame.rowconfigure(1, weight=1)
+
+    def _build_round_multiplier_controls(self, parent: ttk.LabelFrame) -> None:
+        container = ttk.LabelFrame(parent, text="Round Adjustment")
+        container.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        container.columnconfigure(0, weight=1)
+        double_text = "Double down (adds +1 unit)"
+        self._double_check_btn = ttk.Checkbutton(
+            container,
+            text=double_text,
+            variable=self.round_doubled_var,
+        )
+        self._double_check_btn.grid(row=0, column=0, sticky="w", pady=(2, 2))
+        ttk.Label(
+            container,
+            text="Disabled automatically when multiple hands are in play.",
+            foreground="gray",
+        ).grid(row=1, column=0, sticky="w")
+        self._sync_double_option()
+
+    def _sync_double_option(self) -> None:
+        multiple_hands = self._active_hand_count() > 1
+        if multiple_hands and self.round_doubled_var.get():
+            self.round_doubled_var.set(False)
+        if self._double_check_btn:
+            if multiple_hands:
+                self._double_check_btn.state(["disabled"])
+            else:
+                self._double_check_btn.state(["!disabled"])
+
+    def _reset_round_multipliers(self) -> None:
+        self.round_doubled_var.set(False)
+        self._sync_double_option()
 
     def _handle_middle_click(self, _: object) -> None:
         self._import_hands_from_clipboard()
@@ -495,6 +624,12 @@ class BlackjackSimulatorGUI:
     def _all_player_cards(self) -> List[int]:
         return [card for hand in self.player_hands for card in hand]
 
+    def _active_player_hands(self) -> List[tuple[int, List[int]]]:
+        return [(idx, hand) for idx, hand in enumerate(self.player_hands) if hand]
+
+    def _active_hand_count(self) -> int:
+        return len(self._active_player_hands())
+
     def _refresh_player_listbox(self, hand_index: int) -> None:
         if 0 <= hand_index < len(self.player_listboxes):
             self._refresh_listbox(self.player_listboxes[hand_index], self.player_hands[hand_index])
@@ -506,12 +641,15 @@ class BlackjackSimulatorGUI:
             self._remove_card_by_value(target, value, hand_index)
 
     def _add_card_to_hand(self, target: str, value: int, hand_index: int | None = None) -> None:
+        round_was_empty = not self._round_in_progress()
         capacity = self._total_card_capacity(value)
         manual_seen = self.cards_seen_counts[value]
         hand_count = self._all_player_cards().count(value) + self.dealer_cards.count(value)
         if manual_seen + hand_count >= capacity:
             self._set_status(f"All {CARD_LABELS[value]} cards already accounted for.")
             return
+        if round_was_empty:
+            self._maybe_lock_round_bet()
         if target == "player":
             idx = self._resolve_hand_index(hand_index)
             self.player_hands[idx].append(value)
@@ -545,6 +683,7 @@ class BlackjackSimulatorGUI:
                     self._update_player_summary(idx)
                 else:
                     self._update_dealer_summary()
+                self._clear_round_bet_if_idle()
                 self._update_betting_info()
                 self._state_changed()
                 return
@@ -575,6 +714,7 @@ class BlackjackSimulatorGUI:
             self._update_player_summary(idx)
         else:
             self._update_dealer_summary()
+        self._clear_round_bet_if_idle()
         self._update_betting_info()
         if changed:
             self._state_changed()
@@ -595,6 +735,7 @@ class BlackjackSimulatorGUI:
             self._refresh_listbox(self.dealer_listbox, self.dealer_cards)
             self._refresh_hand_buttons("dealer")
         self._update_hand_summaries()
+        self._clear_round_bet_if_idle()
         self._update_betting_info()
         self._state_changed()
 
@@ -607,6 +748,7 @@ class BlackjackSimulatorGUI:
         for idx in range(len(self.player_hands)):
             self._update_player_summary(idx)
         self._update_dealer_summary()
+        self._sync_double_option()
 
     def _update_player_summary(self, hand_index: int) -> None:
         if not self.player_hands:
@@ -640,24 +782,132 @@ class BlackjackSimulatorGUI:
         self._clear_hand("player")
         self._clear_hand("dealer")
         self._clear_seen_cards()
-        self.best_action_var.set("Best action: —")
+        self._set_best_action_display("Best action: —")
         self.ev_breakdown_var.set("Stand: –, Hit: –, Double: –, Split: –, Surrender: –")
         self.insurance_var.set("Insurance EV: –")
         self.status_var.set("")
+        self._round_bet_amount = None
+        self._reset_round_multipliers()
 
-    def _record_game_end(self) -> None:
+    def _record_game_result(self, outcome: str) -> None:
+        if not (self._all_player_cards() or self.dealer_cards):
+            self._set_status("Nothing to record. Add cards first.")
+            return
+        hand_outcomes = self._collect_hand_outcomes(outcome)
+        if hand_outcomes is None:
+            self._set_status("Result entry cancelled.")
+            return
+        bet_amount = self._current_round_bet()
+        profit_delta = self._calculate_profit_delta(bet_amount, hand_outcomes)
+        units_wagered = self._units_wagered(hand_outcomes)
+        if not self._log_current_hands_as_seen():
+            return
+        outcome = outcome.lower()
+        counted_outcome = outcome in {"win", "loss"}
+        if outcome == "win":
+            self.session_stats["wins"] += 1
+            self._apply_bankroll_delta(profit_delta)
+            status = "Logged win"
+        elif outcome == "loss":
+            self.session_stats["losses"] += 1
+            self._apply_bankroll_delta(profit_delta)
+            status = "Logged loss"
+        else:
+            self.session_stats["pushes"] += 1
+            status = "Logged neutral result (not counted in stats)"
+        self.session_stats["net_profit"] += profit_delta
+        if counted_outcome:
+            self._append_history_entry()
+        self._update_stats_summary()
+        self._update_stats_plot()
+        amount_note = ""
+        if outcome in {"win", "loss"} and units_wagered > 0:
+            per_unit = self._format_currency(bet_amount)
+            amount_note = f" using {units_wagered} unit{'s' if units_wagered != 1 else ''} at {per_unit} each"
+        change_note = ""
+        if profit_delta != 0:
+            sign = "+" if profit_delta > 0 else "-"
+            change_note = f" ({sign}{self._format_currency(abs(profit_delta))} impact)"
+        self._round_bet_amount = None
+        self._update_betting_info()
+        self._copy_next_bet_command()
+        self._reset_round_multipliers()
+        self._set_status(f"{status}.{change_note}{amount_note} Hands recorded as seen cards.")
+        self._state_changed()
+
+    def _collect_hand_outcomes(self, default_outcome: str) -> List[str] | None:
+        active_hands = self._active_player_hands()
+        if not active_hands:
+            return []
+        default_outcome = default_outcome.lower()
+        if len(active_hands) == 1 or default_outcome not in {"win", "loss"}:
+            return [default_outcome]
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Resolve Hands")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Select the result for each hand:").grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 4), sticky="w")
+        outcome_vars: List[tk.StringVar] = []
+        for row, (hand_idx, hand_cards) in enumerate(active_hands, start=1):
+            label = f"Hand {hand_idx + 1}: total {self._hand_value(hand_cards)}"
+            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=2)
+            var = tk.StringVar(value=default_outcome)
+            outcome_vars.append(var)
+            for col, choice in enumerate(("win", "loss", "push"), start=1):
+                ttk.Radiobutton(dialog, text=choice.title(), value=choice, variable=var).grid(row=row, column=col, padx=5, pady=2)
+
+        action_frame = ttk.Frame(dialog)
+        action_frame.grid(row=len(active_hands) + 1, column=0, columnspan=3, pady=(10, 10))
+        dialog_result: dict[str, List[str] | None] = {"values": None}
+
+        def confirm() -> None:
+            dialog_result["values"] = [var.get() for var in outcome_vars]
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(action_frame, text="Cancel", command=cancel).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(action_frame, text="Confirm", command=confirm).grid(row=0, column=1)
+        dialog.wait_window()
+        return dialog_result["values"]
+
+    def _calculate_profit_delta(self, bet_amount: float, hand_outcomes: List[str]) -> float:
+        if not hand_outcomes:
+            return 0.0
+        total_units = 0
+        for result in hand_outcomes:
+            result = result.lower()
+            if result == "win":
+                total_units += 1
+            elif result == "loss":
+                total_units -= 1
+        if len(hand_outcomes) == 1 and self.round_doubled_var.get():
+            total_units *= 2
+        return bet_amount * total_units
+
+    def _units_wagered(self, hand_outcomes: List[str]) -> int:
+        if not hand_outcomes:
+            return 0
+        if len(hand_outcomes) == 1 and self.round_doubled_var.get():
+            return 2
+        return len(hand_outcomes)
+
+    def _log_current_hands_as_seen(self) -> bool:
         all_player_cards = self._all_player_cards()
         if not all_player_cards and not self.dealer_cards:
             self._set_status("Nothing to record. Add cards first.")
-            return
+            return False
         moved_cards = all_player_cards + self.dealer_cards
         for card in moved_cards:
             self.cards_seen_counts[card] += 1
             self._update_seen_card_button(card)
         self._clear_hand("player")
         self._clear_hand("dealer")
-        self._set_status("Hands recorded as seen cards.")
-        self._state_changed()
+        self._clear_round_bet_if_idle()
+        self._reset_round_multipliers()
+        return True
 
     def _simulate(self) -> None:
         active_indices = [idx for idx, hand in enumerate(self.player_hands) if hand]
@@ -739,9 +989,9 @@ class BlackjackSimulatorGUI:
         if len(hand_results) == 1:
             # Strip the "Hand 1:" prefix for brevity
             best_action_text = best_lines[0].split(": ", 1)[1]
-            self.best_action_var.set(f"Best action: {best_action_text}")
+            self._set_best_action_display(f"Best action: {best_action_text}", best_action)
         else:
-            self.best_action_var.set("Best actions:\n" + "\n".join(best_lines))
+            self._set_best_action_display("Best actions:\n" + "\n".join(best_lines))
         self.ev_breakdown_var.set("\n".join(breakdown_lines))
         if insurance_value is None or insurance_value != insurance_value:  # NaN guard
             self.insurance_var.set("Insurance EV: –")
@@ -767,16 +1017,21 @@ class BlackjackSimulatorGUI:
             bankroll = max(self.bankroll_var.get(), 0.0)
             actual_bet = min(NEGATIVE_COUNT_MIN_BET, bankroll) if bankroll > 0 else 0.0
             forced_min = actual_bet > 0
-        if forced_min:
+        locked_round = self._round_in_progress() and self._round_bet_amount is not None
+        if locked_round:
+            locked_text = self._format_currency(max(self._round_bet_amount or 0.0, 0.0))
+            bet_text = f"Locked bet: {locked_text} (log result to refresh)"
+        elif forced_min:
             bet_text = f"Suggested bet: Table min (~{self._format_currency(actual_bet)})"
         elif bet_units == 0:
             bet_text = "Suggested bet: Sit out"
         else:
             approx_text = f" (~{self._format_currency(actual_bet)})" if actual_bet > 0 else ""
             bet_text = f"Suggested bet: {bet_units} unit{'s' if bet_units != 1 else ''}{approx_text}"
+        if not locked_round:
+            self._last_bet_amount = actual_bet
         self.bet_var.set(bet_text)
         self.counts_var.set(f"Running: {running:+} | True: {true_count:+.2f} | Cards left: {max(cards_left, 0)}")
-        self._last_bet_amount = actual_bet
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -888,6 +1143,135 @@ class BlackjackSimulatorGUI:
     def _format_currency(self, amount: float) -> str:
         return f"${amount:,.2f}"
 
+    def _round_in_progress(self) -> bool:
+        return any(hand for hand in self.player_hands) or bool(self.dealer_cards)
+
+    def _maybe_lock_round_bet(self) -> None:
+        if self._round_bet_amount is not None:
+            return
+        self._round_bet_amount = max(self._last_bet_amount, 0.0)
+
+    def _clear_round_bet_if_idle(self) -> None:
+        if not self._round_in_progress():
+            self._round_bet_amount = None
+
+    def _current_round_bet(self) -> float:
+        if self._round_bet_amount is None:
+            return max(self._last_bet_amount, 0.0)
+        return max(self._round_bet_amount, 0.0)
+
+    def _apply_bankroll_delta(self, delta: float) -> None:
+        if delta == 0:
+            return
+        new_value = max(self.bankroll_var.get() + delta, 0.0)
+        self.bankroll_var.set(new_value)
+
+    def _update_stats_summary(self) -> None:
+        total_games = self._total_games_played()
+        win_rate = self._win_rate() * 100
+        summary = (
+            f"Games (W/L only): {total_games} | Wins: {self.session_stats['wins']} | Losses: {self.session_stats['losses']} | "
+            f"Pushes: {self.session_stats['pushes']} | Win rate: {win_rate:.1f}% | Net: {self._format_currency(self.session_stats['net_profit'])}"
+        )
+        self.stats_summary_var.set(summary)
+
+    def _update_stats_plot(self) -> None:
+        if not (self._stats_fig and self._stats_canvas and self._winrate_ax and self._profit_ax):
+            return
+        history = list(self.session_stats.get("history", []))
+        self._winrate_ax.clear()
+        self._profit_ax.clear()
+        self._style_stats_axis(self._winrate_ax, "Win %")
+        self._style_stats_axis(self._profit_ax, "Net $", xlabel="Games logged")
+        if not history:
+            self._winrate_ax.text(0.5, 0.5, "Log games to see win %", color=TEXT_COLOR,
+                                   ha="center", va="center", transform=self._winrate_ax.transAxes)
+            self._profit_ax.text(0.5, 0.5, "Net profit history will appear here", color=TEXT_COLOR,
+                                 ha="center", va="center", transform=self._profit_ax.transAxes)
+        else:
+            games: List[int] = []
+            win_rates: List[float] = []
+            profits: List[float] = []
+            for idx, entry in enumerate(history):
+                try:
+                    game_value = int(entry.get("game", idx + 1))
+                except (TypeError, ValueError):
+                    game_value = idx + 1
+                games.append(max(game_value, 1))
+                try:
+                    rate_value = float(entry.get("win_rate", 0.0))
+                except (TypeError, ValueError):
+                    rate_value = 0.0
+                if rate_value != rate_value:  # NaN guard
+                    rate_value = 0.0
+                win_rates.append(max(0.0, min(1.0, rate_value)) * 100)
+                try:
+                    profit_value = float(entry.get("profit", 0.0))
+                except (TypeError, ValueError):
+                    profit_value = 0.0
+                profits.append(profit_value)
+            self._winrate_ax.plot(games, win_rates, color=ACCENT_COLOR, linewidth=2)
+            self._winrate_ax.set_ylim(0, 100)
+            self._profit_ax.plot(games, profits, color="#66ff99", linewidth=2)
+            min_profit = min(profits + [0.0])
+            max_profit = max(profits + [0.0])
+            if min_profit == max_profit:
+                pad = 10.0 if max_profit == 0 else abs(max_profit) * 0.15
+                min_profit -= pad
+                max_profit += pad
+            self._profit_ax.set_ylim(min_profit, max_profit)
+            self._profit_ax.axhline(0, color="#888888", linestyle="--", linewidth=1)
+        self._stats_fig.tight_layout(pad=1.0)
+        self._stats_canvas.draw_idle()
+
+    def _style_stats_axis(self, axis, ylabel: str, xlabel: str | None = None) -> None:
+        axis.set_facecolor(DARK_BG)
+        axis.set_ylabel(ylabel, color=TEXT_COLOR)
+        if xlabel:
+            axis.set_xlabel(xlabel, color=TEXT_COLOR)
+        axis.tick_params(colors=TEXT_COLOR)
+        axis.grid(color="#444444", linestyle="--", linewidth=0.5, alpha=0.5)
+        for spine in axis.spines.values():
+            spine.set_color(TEXT_COLOR)
+
+    def _total_games_played(self) -> int:
+        return int(self.session_stats.get("wins", 0)) + int(self.session_stats.get("losses", 0))
+
+    def _win_rate(self) -> float:
+        total = self._total_games_played()
+        if total <= 0:
+            return 0.0
+        return self.session_stats.get("wins", 0) / total
+
+    def _append_history_entry(self) -> None:
+        total_games = self._total_games_played()
+        if total_games <= 0:
+            self.session_stats["history"] = []
+            return
+        entry = {
+            "game": total_games,
+            "profit": float(self.session_stats.get("net_profit", 0.0)),
+            "win_rate": self._win_rate(),
+        }
+        history = self.session_stats.setdefault("history", [])
+        history.append(entry)
+        if len(history) > STATS_HISTORY_LIMIT:
+            del history[: len(history) - STATS_HISTORY_LIMIT]
+
+    def _confirm_reset_stats(self) -> None:
+        if messagebox.askyesno("Reset Stats", "Clear logged wins, losses, pushes, and profit history?"):
+            self._reset_stats()
+
+    def _reset_stats(self) -> None:
+        self.session_stats = self._default_stats()
+        self._update_stats_summary()
+        self._update_stats_plot()
+        self._state_changed()
+        self._set_status("Session tracking reset.")
+
+    def _default_stats(self) -> Dict[str, object]:
+        return {"wins": 0, "losses": 0, "pushes": 0, "net_profit": 0.0, "history": []}
+
     def _copy_next_bet_command(self) -> None:
         amount = int(round(max(self._last_bet_amount, 0.0)))
         command = f"$bj {amount}"
@@ -976,6 +1360,42 @@ class BlackjackSimulatorGUI:
             active_idx = 0
         self.active_hand_index = min(max(active_idx, 0), len(self.player_hands) - 1)
         self.dealer_cards = sanitize_cards(data.get("dealer_cards", []))
+        stats_data = data.get("session_stats")
+        if isinstance(stats_data, dict):
+            parsed = self._default_stats()
+            for key in ("wins", "losses", "pushes"):
+                try:
+                    parsed[key] = max(int(stats_data.get(key, 0)), 0)
+                except (TypeError, ValueError):
+                    parsed[key] = 0
+            try:
+                parsed["net_profit"] = float(stats_data.get("net_profit", 0.0))
+            except (TypeError, ValueError):
+                parsed["net_profit"] = 0.0
+            history_data = stats_data.get("history", [])
+            parsed_history: List[Dict[str, float]] = []
+            if isinstance(history_data, list):
+                for entry in history_data:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        game = max(int(entry.get("game", 0)), 0)
+                        profit = float(entry.get("profit", 0.0))
+                        win_rate = float(entry.get("win_rate", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    parsed_history.append({"game": game, "profit": profit, "win_rate": win_rate})
+            parsed["history"] = parsed_history[-STATS_HISTORY_LIMIT:]
+            self.session_stats = parsed
+        else:
+            self.session_stats = self._default_stats()
+        round_bet_raw = data.get("round_bet_amount")
+        try:
+            self._round_bet_amount = max(float(round_bet_raw), 0.0) if round_bet_raw is not None else None
+        except (TypeError, ValueError):
+            self._round_bet_amount = None
+        if self._round_bet_amount is not None and not self._round_in_progress():
+            self._round_bet_amount = None
         self._suspend_state = False
 
     def _save_state(self) -> None:
@@ -997,6 +1417,8 @@ class BlackjackSimulatorGUI:
             "player_hands": self.player_hands,
             "dealer_cards": self.dealer_cards,
             "active_hand_index": self.active_hand_index,
+            "session_stats": self.session_stats,
+            "round_bet_amount": self._round_bet_amount,
         }
         try:
             with self._state_path.open("w", encoding="utf-8") as handle:
