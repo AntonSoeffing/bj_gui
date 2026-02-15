@@ -565,7 +565,10 @@ class BlackjackSimulatorGUI:
         self._update_betting_info()
         self._state_changed()
         self._set_status("Hands imported from clipboard.")
-        self.root.after_idle(self._simulate)
+
+        # If the pasted text contains a result line, the hand is likely over; don't auto-simulate.
+        if "result:" not in clipboard_text.lower():
+            self.root.after_idle(self._simulate)
 
     def _parse_clipboard_hands(self, text: str) -> tuple[List[List[int]], List[int]]:
         lower = text.lower()

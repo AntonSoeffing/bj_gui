@@ -9,25 +9,31 @@
   "min_bet": 100.0,
   "allow_surrender": false,
   "burn_count": 1,
-  "bankroll": 1257688.7565486343,
+  "bankroll": 1257689.0,
   "unit_percent": 0.1,
-  "unseen_burned_count": 1,
+  "unseen_burned_count": 0,
   "cards_seen_counts": {
-    "2": 8,
-    "3": 9,
-    "4": 9,
-    "5": 11,
-    "6": 10,
-    "7": 10,
-    "8": 9,
-    "9": 10,
-    "10": 42,
-    "11": 9
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 0,
+    "6": 0,
+    "7": 0,
+    "8": 0,
+    "9": 0,
+    "10": 0,
+    "11": 0
   },
   "player_hands": [
-    []
+    [
+      8,
+      10
+    ]
   ],
-  "dealer_cards": [],
+  "dealer_cards": [
+    6,
+    11
+  ],
   "active_hand_index": 0,
   "session_stats": {
     "wins": 381,
