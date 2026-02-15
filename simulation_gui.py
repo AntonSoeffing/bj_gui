@@ -363,14 +363,14 @@ class BlackjackSimulatorGUI:
         if len(split_hand) == 2 and split_hand[0] == split_hand[1]:
             split_card = split_hand.pop()
             self.player_hands.append([split_card])
-            self.active_hand_index = len(self.player_hands) - 1
+            # Keep focus on the original hand after splitting
             self._rebuild_player_tabs()
             self._update_betting_info()
             self._state_changed()
             self._set_status(f"Split Hand {split_index + 1}.")
             return
         self.player_hands.append([])
-        self.active_hand_index = len(self.player_hands) - 1
+        # Keep focus on the current hand when adding a new empty hand
         self._rebuild_player_tabs()
         self._update_betting_info()
         self._state_changed()
