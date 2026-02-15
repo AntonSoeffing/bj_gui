@@ -107,7 +107,7 @@ class BlackjackSimulatorGUI:
         btn_loss = tk.Button(btn_frame, text="Loss", bg="#e55353", fg="#ffffff",
                      activebackground="#f06b6b", activeforeground="#ffffff", width=10)
 
-        btn_bj.grid(row=0, column=0, padx=2, pady=2)
+        btn_bj.grid(row=0, column=0, padx=(2, 10), pady=2)
         btn_win.grid(row=0, column=1, padx=2, pady=2)
         btn_push.grid(row=0, column=2, padx=2, pady=2)
         btn_loss.grid(row=0, column=3, padx=2, pady=2)
