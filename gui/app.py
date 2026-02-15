@@ -182,6 +182,7 @@ class BlackjackSimulatorGUI:
         self.results_ui.refresh()
         self.calculate_betting_info()
         self.stats_ui.refresh()
+        self._save_state()
 
     def get_card_face(self, val: int) -> str:
         return f"{CARD_ICONS.get(val, '')} {CARD_LABELS[val]}"
@@ -313,20 +314,25 @@ class BlackjackSimulatorGUI:
             bet_units = CardCountBetter.get_bet(seen_flat, deck_n)
         except: pass
 
-        # Clamp to table minimum when true count is very negative
-        if true_cnt <= NEGATIVE_COUNT_THRESHOLD:
-            bet_units = 0
-        elif bet_units > 1 and phys_left < 20: # Low shoe logic check
-            bet_units = max(1, bet_units // 2)
-
-        # Money
         bank = self.state.betting.bankroll
         unit_val = bank * (self.state.betting.unit_percent / 100)
-        rec_bet_amt = min(bank, bet_units * unit_val)
         min_bet = self.state.betting.min_bet
-        
-        if rec_bet_amt > 0 and rec_bet_amt < min_bet:
+
+        if true_cnt <= NEGATIVE_COUNT_THRESHOLD:
+            # Force minimum dollar bet when shoe is bad
             rec_bet_amt = min(bank, min_bet)
+            # Derive units so the label is consistent (at least 1 unit)
+            if unit_val > 0:
+                bet_units = max(1, int((rec_bet_amt + unit_val - 1) // unit_val))
+            else:
+                bet_units = 1
+        else:
+            if bet_units > 1 and phys_left < 20: # Low shoe logic check
+                bet_units = max(1, bet_units // 2)
+
+            rec_bet_amt = min(bank, bet_units * unit_val)
+            if rec_bet_amt > 0 and rec_bet_amt < min_bet:
+                rec_bet_amt = min(bank, min_bet)
 
         # Display
         self.state.last_bet_amount = rec_bet_amt
@@ -576,12 +582,15 @@ class BlackjackSimulatorGUI:
         except Exception as e:
             print(f"Failed to load state: {e}")
 
-    def on_close(self):
-        # Save state
+    def _save_state(self):
         try:
             data = dataclasses.asdict(self.state)
             with open(STATE_FILE, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"Failed to save state: {e}")
+
+    def on_close(self):
+        # Save state
+        self._save_state()
         self.root.destroy()
