@@ -37,7 +37,6 @@ CARD_ICONS: Dict[int, str] = {
 ACTION_LABELS: tuple[str, ...] = ("Stand", "Hit", "Double", "Split", "Surrender")
 CARD_CODE_PATTERN = re.compile(r":\s*((?:10|[2-9]|[TJQKA])[HDCS]?)\s*:", re.IGNORECASE)
 NEGATIVE_COUNT_THRESHOLD = -0.5
-NEGATIVE_COUNT_MIN_BET = 100.0
 STATS_HISTORY_LIMIT = 500
 
 DARK_BG = "#1e1e1e"
@@ -78,6 +77,7 @@ class BlackjackSimulatorGUI:
         self.allow_surrender_var = tk.BooleanVar(value=False)
         self.bankroll_var = tk.DoubleVar(value=1000.0)
         self.unit_percent_var = tk.DoubleVar(value=0.5)
+        self.min_bet_var = tk.DoubleVar(value=100.0)
 
         self._state_path = STATE_FILE
         self._suspend_state = False
@@ -104,18 +104,27 @@ class BlackjackSimulatorGUI:
         self.ev_breakdown_var = tk.StringVar(value="Stand: –, Hit: –, Double: –, Split: –, Surrender: –")
         self.insurance_var = tk.StringVar(value="Insurance EV: –")
         self.bet_var = tk.StringVar(value="Suggested bet: 1 unit")
-        self.counts_var = tk.StringVar(value="Running: +0 | True: +0.00 | Cards left: 0")
+        self.counts_var = tk.StringVar(value="Running: +0 | True: +0.00 | Left: 0 (Phys: 0)")
         self.status_var = tk.StringVar(value="")
         self._last_bet_amount = 0.0
         self._round_bet_amount: float | None = None
         self.round_doubled_var = tk.BooleanVar(value=False)
         self._double_check_btn: ttk.Checkbutton | None = None
+        self.unseen_burned_count = 0
         self.session_stats = self._default_stats()
         self.stats_summary_var = tk.StringVar(value="Games: 0 | Win rate: 0.0% | Net: $0.00")
         self._stats_fig: Figure | None = None
         self._stats_canvas: FigureCanvasTkAgg | None = None
         self._winrate_ax = None
         self._profit_ax = None
+        self._stats_container: ttk.Frame | None = None
+        self._stats_toggle_btn: ttk.Button | None = None
+        self._content_canvas: tk.Canvas | None = None
+        self._content_frame: ttk.Frame | None = None
+        self._content_scrollbar: ttk.Scrollbar | None = None
+        self._content_window_id: int | None = None
+
+        self._build_scroll_container()
 
         self._load_state()
         self._build_layout()
@@ -128,8 +137,9 @@ class BlackjackSimulatorGUI:
         self._state_changed()
 
     def _build_layout(self) -> None:
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        if not self._content_frame:
+            return
+        self._content_frame.columnconfigure(0, weight=1)
 
         self._build_rules_section()
         self._build_seen_cards_section()
@@ -137,15 +147,54 @@ class BlackjackSimulatorGUI:
         self._build_actions_section()
         self._build_results_section()
         self._build_stats_section()
+        self._content_frame.rowconfigure(5, weight=1)
+
+    def _build_scroll_container(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(self.root, bg=DARK_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def on_content_configure(_: object) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        content.bind("<Configure>", on_content_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        self._content_canvas = canvas
+        self._content_frame = content
+        self._content_scrollbar = scrollbar
+        self._content_window_id = window_id
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        if not self._content_canvas:
+            return
+        if event.delta == 0:
+            return
+        self._content_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _register_traces(self) -> None:
         self.deck_number_var.trace_add("write", self._handle_deck_change)
         self.max_splits_var.trace_add("write", self._handle_max_splits_change)
         self.bankroll_var.trace_add("write", self._handle_bankroll_change)
         self.unit_percent_var.trace_add("write", self._handle_unit_percent_change)
+        self.min_bet_var.trace_add("write", self._handle_min_bet_change)
 
     def _build_rules_section(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Rules")
+        if not self._content_frame:
+            return
+        frame = ttk.LabelFrame(self._content_frame, text="Rules")
         frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
         frame.columnconfigure(9, weight=1)
 
@@ -182,8 +231,15 @@ class BlackjackSimulatorGUI:
         unit_spin.grid(row=2, column=3, padx=4, pady=(8, 4))
         self._style_entry(unit_spin)
 
+        ttk.Label(frame, text="Min Bet ($):").grid(row=2, column=4, sticky="w", padx=4, pady=(8, 4))
+        min_bet_spin = tk.Spinbox(frame, from_=0, to=10000, increment=5, textvariable=self.min_bet_var, width=10)
+        min_bet_spin.grid(row=2, column=5, padx=4, pady=(8, 4))
+        self._style_entry(min_bet_spin)
+
     def _build_seen_cards_section(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Seen Cards")
+        if not self._content_frame:
+            return
+        frame = ttk.LabelFrame(self._content_frame, text="Seen Cards")
         frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
         frame.columnconfigure(tuple(range(11)), weight=1)
 
@@ -211,7 +267,9 @@ class BlackjackSimulatorGUI:
         burn_frame.columnconfigure(3, weight=1)
 
     def _build_hand_section(self) -> None:
-        container = ttk.LabelFrame(self.root, text="Hands")
+        if not self._content_frame:
+            return
+        container = ttk.LabelFrame(self._content_frame, text="Hands")
         container.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
@@ -300,9 +358,21 @@ class BlackjackSimulatorGUI:
         self._update_hand_summaries()
 
     def _add_player_hand(self) -> None:
+        split_index = self._resolve_hand_index(self.active_hand_index)
+        split_hand = self.player_hands[split_index]
+        if len(split_hand) == 2 and split_hand[0] == split_hand[1]:
+            split_card = split_hand.pop()
+            self.player_hands.append([split_card])
+            self.active_hand_index = len(self.player_hands) - 1
+            self._rebuild_player_tabs()
+            self._update_betting_info()
+            self._state_changed()
+            self._set_status(f"Split Hand {split_index + 1}.")
+            return
         self.player_hands.append([])
         self.active_hand_index = len(self.player_hands) - 1
         self._rebuild_player_tabs()
+        self._update_betting_info()
         self._state_changed()
 
     def _remove_current_player_hand(self) -> None:
@@ -318,7 +388,9 @@ class BlackjackSimulatorGUI:
         self._set_status(f"Removed Hand {removed_idx + 1}.")
 
     def _build_actions_section(self) -> None:
-        frame = ttk.Frame(self.root)
+        if not self._content_frame:
+            return
+        frame = ttk.Frame(self._content_frame)
         frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
         frame.columnconfigure(4, weight=1)
         ttk.Button(frame, text="Run Simulation", command=self._simulate).grid(row=0, column=0, padx=4, pady=4)
@@ -333,7 +405,9 @@ class BlackjackSimulatorGUI:
         ttk.Label(frame, textvariable=self.status_var, foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w")
 
     def _build_results_section(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Results & Betting")
+        if not self._content_frame:
+            return
+        frame = ttk.LabelFrame(self._content_frame, text="Results & Betting")
         frame.grid(row=4, column=0, padx=10, pady=10, sticky="ew")
         frame.columnconfigure(0, weight=1)
         best_frame = tk.Frame(frame, bg=BEST_ACTION_BG, highlightbackground=BEST_ACTION_BORDER,
@@ -385,27 +459,44 @@ class BlackjackSimulatorGUI:
         self.best_action_label.configure(fg=color)
 
     def _build_stats_section(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Session Tracking")
+        if not self._content_frame:
+            return
+        frame = ttk.LabelFrame(self._content_frame, text="Session Tracking")
         frame.grid(row=5, column=0, padx=10, pady=(0, 10), sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=0)
-        ttk.Label(frame, textvariable=self.stats_summary_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(frame, text="Reset Stats", command=self._confirm_reset_stats).grid(row=0, column=1, sticky="e", padx=4)
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, textvariable=self.stats_summary_var).grid(row=0, column=0, sticky="w")
+        self._stats_toggle_btn = ttk.Button(header, text="Hide", command=self._toggle_stats_section)
+        self._stats_toggle_btn.grid(row=0, column=1, sticky="e", padx=(0, 4))
+        ttk.Button(header, text="Reset Stats", command=self._confirm_reset_stats).grid(row=0, column=2, sticky="e", padx=4)
         self._stats_fig = Figure(figsize=(6.5, 3.5), dpi=100)
         self._stats_fig.patch.set_facecolor(PANEL_BG)
         self._winrate_ax = self._stats_fig.add_subplot(211)
         self._profit_ax = self._stats_fig.add_subplot(212)
         self._style_stats_axis(self._winrate_ax, "Win %")
         self._style_stats_axis(self._profit_ax, "Net $", xlabel="Games logged")
-        widget = ttk.Frame(frame)
-        widget.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
-        widget.columnconfigure(0, weight=1)
-        widget.rowconfigure(0, weight=1)
-        self._stats_canvas = FigureCanvasTkAgg(self._stats_fig, master=widget)
+        self._stats_container = ttk.Frame(frame)
+        self._stats_container.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        self._stats_container.columnconfigure(0, weight=1)
+        self._stats_container.rowconfigure(0, weight=1)
+        self._stats_canvas = FigureCanvasTkAgg(self._stats_fig, master=self._stats_container)
         canvas_widget = self._stats_canvas.get_tk_widget()
         canvas_widget.configure(bg=PANEL_BG)
         canvas_widget.grid(row=0, column=0, sticky="nsew")
         frame.rowconfigure(1, weight=1)
+
+    def _toggle_stats_section(self) -> None:
+        if not self._stats_container or not self._stats_toggle_btn:
+            return
+        if self._stats_container.winfo_ismapped():
+            self._stats_container.grid_remove()
+            self._stats_toggle_btn.configure(text="Show")
+        else:
+            self._stats_container.grid()
+            self._stats_toggle_btn.configure(text="Hide")
 
     def _build_round_multiplier_controls(self, parent: ttk.LabelFrame) -> None:
         container = ttk.LabelFrame(parent, text="Round Adjustment")
@@ -580,6 +671,7 @@ class BlackjackSimulatorGUI:
         for value in CARD_VALUES:
             self.cards_seen_counts[value] = 0
             self._update_seen_card_button(value)
+        self.unseen_burned_count = 0
         self._update_betting_info()
         self._state_changed()
 
@@ -588,26 +680,19 @@ class BlackjackSimulatorGUI:
         if count <= 0:
             self._set_status("Enter how many cards to remove.")
             return
-        try:
-            remaining_shoe = list(self._build_cards_not_seen())
-        except ValueError as exc:
-            messagebox.showerror("Invalid shoe", str(exc))
-            return
-        available = len(remaining_shoe)
-        if available == 0:
+        cards_seen = self._get_total_seen_cards(include_hands=True)
+        deck_number = max(self.deck_number_var.get(), 1)
+        cards_left = deck_number * 52 - len(cards_seen)
+        physical_left = max(cards_left - self.unseen_burned_count, 0)
+        if physical_left == 0:
             self._set_status("No cards left to remove.")
             return
-        if count > available:
-            messagebox.showerror("Invalid burn", f"Only {available} cards remain in the shoe.")
+        if count > physical_left:
+            messagebox.showerror("Invalid burn", f"Only {physical_left} cards remain in the shoe.")
             return
-        drawn_cards = random.sample(remaining_shoe, count)
-        drawn_counts = Counter(drawn_cards)
-        for value, amount in drawn_counts.items():
-            self.cards_seen_counts[value] += amount
-            self._update_seen_card_button(value)
+        self.unseen_burned_count += count
         self._update_betting_info()
-        summary = ", ".join(f"{CARD_LABELS[value]}x{amount}" for value, amount in sorted(drawn_counts.items()))
-        self._set_status(f"Burned cards: {summary}")
+        self._set_status(f"Burned {count} unseen card(s).")
         self._state_changed()
 
     def _resolve_hand_index(self, hand_index: int | None) -> int:
@@ -1006,16 +1091,36 @@ class BlackjackSimulatorGUI:
         deck_number = max(self.deck_number_var.get(), 1)
         running = get_hilo_running_count(cards_seen)
         cards_left = deck_number * 52 - len(cards_seen)
+        physical_left = max(cards_left - self.unseen_burned_count, 0)
         true_count = 0.0 if cards_left <= 0 else running / (cards_left / 52)
         try:
             bet_units = CardCountBetter.get_bet(cards_seen, deck_number)
         except ZeroDivisionError:
             bet_units = 0
+
+        bet_note = ""
+        if bet_units > 1 and physical_left > 0:
+            active_hands = max(self._active_hand_count(), 1)
+            estimated_needed = (active_hands + 1) * 4
+            if physical_left < estimated_needed:
+                factor = physical_left / estimated_needed
+                adjusted_units = 1 + (bet_units - 1) * factor
+                reduced_units = max(1, int(adjusted_units))
+                if reduced_units < bet_units:
+                    bet_units = reduced_units
+                    bet_note = " (reduced: low shoe)"
+
         actual_bet = self._calculate_actual_bet(bet_units)
+        min_bet_val = max(self.min_bet_var.get(), 0.0)
+        bankroll = max(self.bankroll_var.get(), 0.0)
+
+        # Enforce minimum bet if betting > 0
+        if actual_bet > 0 and actual_bet < min_bet_val:
+            actual_bet = min(min_bet_val, bankroll)
+
         forced_min = False
         if true_count < NEGATIVE_COUNT_THRESHOLD:
-            bankroll = max(self.bankroll_var.get(), 0.0)
-            actual_bet = min(NEGATIVE_COUNT_MIN_BET, bankroll) if bankroll > 0 else 0.0
+            actual_bet = min(min_bet_val, bankroll) if bankroll > 0 else 0.0
             forced_min = actual_bet > 0
         locked_round = self._round_in_progress() and self._round_bet_amount is not None
         if locked_round:
@@ -1027,11 +1132,13 @@ class BlackjackSimulatorGUI:
             bet_text = "Suggested bet: Sit out"
         else:
             approx_text = f" (~{self._format_currency(actual_bet)})" if actual_bet > 0 else ""
-            bet_text = f"Suggested bet: {bet_units} unit{'s' if bet_units != 1 else ''}{approx_text}"
+            bet_text = f"Suggested bet: {bet_units} unit{'s' if bet_units != 1 else ''}{approx_text}{bet_note}"
         if not locked_round:
             self._last_bet_amount = actual_bet
         self.bet_var.set(bet_text)
-        self.counts_var.set(f"Running: {running:+} | True: {true_count:+.2f} | Cards left: {max(cards_left, 0)}")
+        self.counts_var.set(
+            f"Running: {running:+} | True: {true_count:+.2f} | Left: {max(cards_left, 0)} (Phys: {physical_left})"
+        )
 
     def _set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -1047,6 +1154,8 @@ class BlackjackSimulatorGUI:
             value = 1
         self.deck_number_var.set(value)
         self._clamp_seen_counts()
+        cards_left = self.deck_number_var.get() * 52 - len(self._get_total_seen_cards(include_hands=True))
+        self.unseen_burned_count = min(self.unseen_burned_count, max(cards_left, 0))
         self._update_betting_info()
         self._state_changed()
 
@@ -1084,6 +1193,17 @@ class BlackjackSimulatorGUI:
         elif value > 100:
             value = 100.0
         self.unit_percent_var.set(value)
+        self._update_betting_info()
+        self._state_changed()
+
+    def _handle_min_bet_change(self, *_: object) -> None:
+        try:
+            value = float(self.min_bet_var.get())
+        except (tk.TclError, ValueError):
+            value = 0.0
+        if value < 0:
+            value = 0.0
+        self.min_bet_var.set(value)
         self._update_betting_info()
         self._state_changed()
 
@@ -1325,6 +1445,14 @@ class BlackjackSimulatorGUI:
             self.unit_percent_var.set(float(data.get("unit_percent", self.unit_percent_var.get())))
         except (TypeError, ValueError):
             self.unit_percent_var.set(1.0)
+        try:
+            self.min_bet_var.set(float(data.get("min_bet", self.min_bet_var.get())))
+        except (TypeError, ValueError):
+            self.min_bet_var.set(100.0)
+        try:
+            self.unseen_burned_count = max(int(data.get("unseen_burned_count", 0)), 0)
+        except (TypeError, ValueError):
+            self.unseen_burned_count = 0
 
         counts_data = data.get("cards_seen_counts", {})
         if isinstance(counts_data, dict):
@@ -1409,10 +1537,12 @@ class BlackjackSimulatorGUI:
             "das": self.das_var.get(),
             "allow_double": self.allow_double_var.get(),
             "allow_insurance": self.allow_insurance_var.get(),
+            "min_bet": self.min_bet_var.get(),
             "allow_surrender": self.allow_surrender_var.get(),
             "burn_count": self.burn_count_var.get(),
             "bankroll": self.bankroll_var.get(),
             "unit_percent": self.unit_percent_var.get(),
+            "unseen_burned_count": self.unseen_burned_count,
             "cards_seen_counts": self.cards_seen_counts,
             "player_hands": self.player_hands,
             "dealer_cards": self.dealer_cards,
@@ -1446,7 +1576,7 @@ class BlackjackSimulatorGUI:
 
     def _confirm_burn_cards(self) -> None:
         count = self.burn_count_var.get()
-        if self._double_confirm("Burn Cards", f"Remove {count} unseen card(s) at random?"):
+        if self._double_confirm("Burn Cards", f"Remove {count} unseen card(s) from the shoe?"):
             self._burn_unknown_cards()
 
     def _confirm_clear_everything(self) -> None:
