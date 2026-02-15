@@ -312,8 +312,11 @@ class BlackjackSimulatorGUI:
         try:
             bet_units = CardCountBetter.get_bet(seen_flat, deck_n)
         except: pass
-        
-        if bet_units > 1 and phys_left < 20: # Low shoe logic check
+
+        # Clamp to table minimum when true count is very negative
+        if true_cnt <= NEGATIVE_COUNT_THRESHOLD:
+            bet_units = 0
+        elif bet_units > 1 and phys_left < 20: # Low shoe logic check
             bet_units = max(1, bet_units // 2)
 
         # Money
