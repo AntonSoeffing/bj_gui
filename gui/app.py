@@ -12,7 +12,7 @@ from typing import Optional
 # GUI Package Imports
 from .state import GameState, GameRules, BettingSettings, SessionStats
 from .theme import Theme
-from .constants import STATE_FILE, CARD_LABELS, CARD_ICONS, CARD_VALUES, ACTION_LABELS
+from .constants import STATE_FILE, CARD_LABELS, CARD_ICONS, CARD_VALUES, ACTION_LABELS, NEGATIVE_COUNT_THRESHOLD
 from .hand_utils import HandUtils
 from .components.rules_frame import RulesFrame
 from .components.seen_cards_frame import SeenCardsFrame
